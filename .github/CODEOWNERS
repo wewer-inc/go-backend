@@ -1,0 +1,17 @@
+# Default ownership
+* @wewer-inc/owners
+
+# Repository governance and automation
+.github/ @wewer-inc/owners
+.github/workflows/ @wewer-inc/owners
+.github/CODEOWNERS @wewer-inc/owners
+
+# Security-sensitive files
+SECURITY.md @wewer-inc/owners
+.env.example @wewer-inc/owners
+
+# Documentation
+README.md @wewer-inc/owners
+CONTRIBUTING.md @wewer-inc/owners
+CODE_OF_CONDUCT.md @wewer-inc/owners
+ARCHITECTURE.md @wewer-inc/owners

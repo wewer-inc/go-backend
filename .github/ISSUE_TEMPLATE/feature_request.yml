@@ -1,0 +1,41 @@
+name: Feature Request
+description: Propose a new pattern or capability for the foundation
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests should be about patterns, tooling, or infrastructure — not product or business logic.
+        If you are unsure whether something belongs, open a discussion first.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What engineering problem does this address? Why does the current foundation not cover it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you add or change? Be specific about files and interfaces.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you consider and why did you rule them out?
+    validations:
+      required: false
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: New dependencies
+      description: Does this require adding a Go module dependency? If so, name it and justify it.
+    validations:
+      required: false

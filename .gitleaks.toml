@@ -1,0 +1,6 @@
+[allowlist]
+  description = "Allowlist for known placeholder / test values"
+  paths = [
+    ".env.example",
+    "internal/platform/config/config_test.go",
+  ]

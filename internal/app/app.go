@@ -1,0 +1,187 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	httpserver "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/server"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
+	pdb "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/db"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/logger"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/objectstore"
+	redisstore "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/redis"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/versioning"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/worker"
+	"github.com/rs/zerolog"
+	"gorm.io/gorm"
+)
+
+type App struct {
+	cfg         config.Config
+	log         zerolog.Logger
+	srv         *http.Server
+	db          *gorm.DB
+	ObjectStore objectstore.Store
+	Redis       *redisstore.Client
+	Mailer      email.Mailer
+	Worker      *worker.Worker
+}
+
+// Build wires all dependencies and returns a ready-to-start App.
+func Build(build versioning.BuildInfo) (*App, error) {
+	cfg := config.Load()
+	log := logger.NewLogger(cfg)
+
+	gdb, err := pdb.Start(context.Background(), pdb.Config{
+		DSN:             cfg.DB_DSN,
+		MigrateOnStart:  cfg.DB_MIGRATE_ON_START,
+		MaxOpen:         cfg.DB_MAX_OPEN,
+		MaxIdle:         cfg.DB_MAX_IDLE,
+		ConnMaxLifetime: cfg.DB_CONN_LIFETIME,
+		ConnMaxIdleTime: cfg.DB_CONN_IDLE_TIME,
+		SlowThreshold:   cfg.DB_SLOW_THRESHOLD,
+	}, log)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+
+	s3Store, err := objectstore.NewS3Store(ctx, cfg.S3)
+	if err != nil {
+		return nil, err
+	}
+
+	hcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := s3Store.HealthCheck(hcCtx); err != nil {
+		log.Error().Err(err).Msg("s3: health check failed")
+		return nil, err
+	}
+
+	redisClient, err := redisstore.NewClient(cfg.Redis)
+	if err != nil {
+		return nil, err
+	}
+
+	redisCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	if err := redisClient.HealthCheck(redisCtx); err != nil {
+		log.Error().Err(err).Msg("redis: health check failed")
+		return nil, err
+	}
+
+	// Email: use SMTP in prod, noop in dev
+	var mailer email.Mailer
+	if cfg.Env == "prod" && cfg.SMTP.Host != "" {
+		mailer = email.NewSMTPMailer(email.Config{
+			Host:     cfg.SMTP.Host,
+			Port:     cfg.SMTP.Port,
+			From:     cfg.SMTP.From,
+			Password: cfg.SMTP.Password,
+			UseTLS:   cfg.SMTP.UseTLS,
+		})
+	} else {
+		mailer = email.NewNoopMailer(log)
+	}
+
+	// Background worker: 4 goroutines, queue of 100
+	w := worker.New(4, 100, log)
+
+	deps := httpserver.Deps{
+		Cfg:      cfg,
+		Log:      log,
+		DB:       gdb,
+		ObjStore: s3Store,
+		Redis:    redisClient,
+	}
+
+	handler := httpserver.NewRouter(deps, build)
+
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+
+	return &App{
+		cfg:         cfg,
+		log:         log,
+		srv:         srv,
+		db:          gdb,
+		ObjectStore: s3Store,
+		Redis:       redisClient,
+		Mailer:      mailer,
+		Worker:      w,
+	}, nil
+}
+
+func (a *App) Start() error {
+	a.log.Info().Str("addr", a.srv.Addr).Msg("http: listening")
+
+	// Start background worker pool
+	a.Worker.Start(context.Background())
+
+	go func() {
+		if err := a.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) && err != nil {
+			a.log.Error().Err(err).Msg("http: server error")
+		}
+	}()
+	return nil
+}
+
+func (a *App) Stop(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+
+	a.log.Info().Msg("http: shutting down")
+
+	var errs []error
+
+	if a.srv != nil {
+		if err := a.srv.Shutdown(ctx); err != nil {
+			a.log.Error().Err(err).Msg("http: shutdown error")
+			errs = append(errs, err)
+		} else {
+			a.log.Info().Msg("http: server stopped")
+		}
+	}
+
+	// Drain worker queue
+	if a.Worker != nil {
+		a.Worker.Stop()
+		a.log.Info().Msg("worker: drained")
+	}
+
+	if a.db != nil {
+		if err := pdb.Stop(a.db); err != nil {
+			a.log.Error().Err(err).Msg("db: connection pool shutdown error")
+			errs = append(errs, err)
+		} else {
+			a.log.Info().Msg("db: connection pool closed")
+		}
+	}
+
+	if a.Redis != nil {
+		if err := a.Redis.Close(); err != nil {
+			a.log.Error().Err(err).Msg("redis: client shutdown error")
+			errs = append(errs, err)
+		} else {
+			a.log.Info().Msg("redis: client closed")
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	a.log.Info().Msg("app: shutdown complete")
+	return nil
+}

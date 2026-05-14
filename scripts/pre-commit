@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run Go quality gates via Makefile
+# Order: fmt → vet → lint → gosec → test → vuln (vuln is optional / CI)
+set -euo pipefail
+
+YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; BOLD="\033[1m"; RESET="\033[0m"
+
+echo -e "${BOLD}pre-commit:${RESET} checking staged files..."
+
+# Only run if there are staged Go files (add more patterns if you want)
+STAGED_GO=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.go$' || true)
+if [ -z "${STAGED_GO}" ]; then
+  echo -e "${YELLOW}No staged Go files; skipping Go checks.${RESET}"
+  exit 0
+fi
+
+# Ensure we run from repo root
+cd "$(git rev-parse --show-toplevel)"
+
+# 1) Format (may modify files)
+echo -e "${BOLD}> make fmt${RESET}"
+make fmt
+
+# If fmt changed files, re-stage them so commit includes formatting updates
+CHANGED=$(git diff --name-only -- '*.go' || true)
+if [ -n "${CHANGED}" ]; then
+  echo -e "${YELLOW}Formatting changed files; re-staging...${RESET}"
+  git add ${CHANGED}
+fi
+
+# 2) Vet
+echo -e "${BOLD}> make vet${RESET}"
+make vet
+
+# 3) Lint
+echo -e "${BOLD}> make lint${RESET}"
+make lint
+
+# 3.5) Gosec — static security scan
+# Tip: set SKIP_GOSEC=1 to bypass locally: SKIP_GOSEC=1 git commit -m "..."
+if [ "${SKIP_GOSEC:-0}" != "1" ]; then
+  echo -e "${BOLD}> make gosec${RESET}"
+  if ! make gosec; then
+    echo -e "${RED}gosec scan failed. Fix issues or bypass with SKIP_GOSEC=1.${RESET}"
+    exit 1
+  fi
+else
+  echo -e "${YELLOW}Skipping gosec due to SKIP_GOSEC=1${RESET}"
+fi
+
+# 4) Tests (fast unit tests; keep comprehensive or race tests in CI if slow)
+#    Tip: set SKIP_TESTS=1 to bypass locally: SKIP_TESTS=1 git commit -m "..."
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  echo -e "${BOLD}> make test${RESET}"
+  make test
+else
+  echo -e "${YELLOW}Skipping tests due to SKIP_TESTS=1${RESET}"
+fi
+
+# Optional: run vuln scan only when explicitly requested (it's slower)
+# Use: RUN_VULN=1 git commit -m "..."
+if [ "${RUN_VULN:-0}" = "1" ]; then
+  echo -e "${BOLD}> make vuln${RESET}"
+  make vuln || {
+    echo -e "${RED}Vulnerability scan failed. Fix or commit with RUN_VULN=0 to skip.${RESET}"
+    exit 1
+  }
+fi
+
+echo -e "${GREEN}✓ pre-commit checks passed${RESET}"
+exit 0
