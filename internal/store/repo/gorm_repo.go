@@ -13,14 +13,14 @@ func (r *GormRepo[T]) Create(ctx context.Context, entity *T) error {
 	if entity == nil {
 		return nil
 	}
-	return r.db.WithContext(ctx).Create(entity).Error
+	return r.conn(ctx).Create(entity).Error
 }
 
 // GetByID retrieves an record of type T by its primary key ID.
 func (r *GormRepo[T]) GetByID(ctx context.Context, id uint) (*T, error) {
 	var entity T
 
-	if err := r.db.WithContext(ctx).First(&entity, id).Error; err != nil {
+	if err := r.conn(ctx).First(&entity, id).Error; err != nil {
 		return nil, err
 	}
 	return &entity, nil
@@ -30,7 +30,7 @@ func (r *GormRepo[T]) GetByID(ctx context.Context, id uint) (*T, error) {
 func (r *GormRepo[T]) GetByUUID(ctx context.Context, id uuid.UUID) (*T, error) {
 	var entity T
 
-	if err := r.db.WithContext(ctx).
+	if err := r.conn(ctx).
 		Where("uuid = ?", id).
 		First(&entity).Error; err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ func (r *GormRepo[T]) GetOne(ctx context.Context, opts store.QueryOpts) (*T, err
 		entity T
 		zeroT  T
 	)
-	db := r.db.WithContext(ctx).Model(&zeroT)
+	db := r.conn(ctx).Model(&zeroT)
 	db = applyQueryOptsBase(db, opts)
 	if err := db.First(&entity).Error; err != nil {
 		return nil, err
@@ -59,7 +59,7 @@ func (r *GormRepo[T]) Exists(ctx context.Context, opts store.QueryOpts) (bool, e
 		zeroT T
 	)
 
-	db := r.db.WithContext(ctx).Model(&zeroT)
+	db := r.conn(ctx).Model(&zeroT)
 	db = applyQueryOptsBase(db, opts)
 
 	// Ignore pagination and fetch cheapest result
@@ -86,7 +86,7 @@ func (r *GormRepo[T]) List(ctx context.Context, opts store.QueryOpts) ([]T, stor
 	)
 
 	// 1) count query (no pagination)
-	countDB := r.db.WithContext(ctx).Model(&zeroT)
+	countDB := r.conn(ctx).Model(&zeroT)
 	countDB = applyQueryOptsBase(countDB, opts)
 
 	if err := countDB.Count(&total).Error; err != nil {
@@ -94,7 +94,7 @@ func (r *GormRepo[T]) List(ctx context.Context, opts store.QueryOpts) ([]T, stor
 	}
 
 	// 2) data query (with pagination)
-	dataDB := r.db.WithContext(ctx).Model(&zeroT)
+	dataDB := r.conn(ctx).Model(&zeroT)
 	dataDB = applyQueryOptsBase(dataDB, opts)
 
 	offset := (page - 1) * pageSize
@@ -123,7 +123,7 @@ func (r *GormRepo[T]) Count(ctx context.Context, opts store.QueryOpts) (int64, e
 		total int64
 		zeroT T
 	)
-	db := r.db.WithContext(ctx).Model(&zeroT)
+	db := r.conn(ctx).Model(&zeroT)
 	db = applyQueryOptsBase(db, opts)
 
 	// Ignore pagination for count even if set in opts
@@ -140,13 +140,13 @@ func (r *GormRepo[T]) Update(ctx context.Context, entity *T) error {
 	if entity == nil {
 		return nil
 	}
-	return r.db.WithContext(ctx).Save(entity).Error
+	return r.conn(ctx).Save(entity).Error
 }
 
 // UpdateColumnsByID updates specific columns for entity T by primary key ID without invoking hooks.
 func (r *GormRepo[T]) UpdateColumnsByID(ctx context.Context, id uint, cols map[string]any) error {
 	var zeroT T
-	return r.db.WithContext(ctx).
+	return r.conn(ctx).
 		Model(&zeroT).
 		Where("id = ?", id).
 		UpdateColumns(cols).Error
@@ -155,13 +155,13 @@ func (r *GormRepo[T]) UpdateColumnsByID(ctx context.Context, id uint, cols map[s
 // SoftDelete marks an entity of type T as deleted by its primary key ID.
 func (r *GormRepo[T]) SoftDelete(ctx context.Context, id uint) error {
 	var zeroT T
-	return r.db.WithContext(ctx).Delete(&zeroT, id).Error
+	return r.conn(ctx).Delete(&zeroT, id).Error
 }
 
 // HardDelete permanently removes an entity of type T from the database by its primary key ID.
 func (r *GormRepo[T]) HardDelete(ctx context.Context, id uint) error {
 	var zeroT T
-	return r.db.WithContext(ctx).Unscoped().Delete(&zeroT, id).Error
+	return r.conn(ctx).Unscoped().Delete(&zeroT, id).Error
 }
 
 // Upsert inserts or updates an entity of type T based on conflict keys.
@@ -170,7 +170,7 @@ func (r *GormRepo[T]) Upsert(ctx context.Context, entity *T, conflictKeys []stri
 		return nil
 	}
 
-	db := r.db.WithContext(ctx)
+	db := r.conn(ctx)
 
 	// No conflict keys -> simple save behavior
 	if len(conflictKeys) == 0 {

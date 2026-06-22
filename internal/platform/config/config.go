@@ -28,6 +28,7 @@ type S3Config struct {
 type JWTConfig struct {
 	SecretKey          string
 	TokenIssuer        string
+	TokenAudience      string        // expected `aud` claim; empty disables audience validation
 	TokenExpiration    time.Duration // access token expiry
 	RefreshTokenExpiry time.Duration
 }
@@ -83,6 +84,14 @@ type Config struct {
 	// Ready Checks Timeout Period
 	ReadyCheckTimeout time.Duration // default to 3 seconds for now
 
+	// --- HTTP hardening ---
+	MaxRequestBodyBytes int64 // cap on request body size; 0 disables
+	MaxHeaderBytes      int   // cap on request header size
+
+	// Comma-separated CIDR/IPs of trusted reverse proxies. When set, gin uses
+	// these to derive ClientIP from X-Forwarded-For; otherwise XFF is ignored.
+	TrustedProxies []string
+
 	// --- Database Bootstrap Settings ---
 	DB_DSN              string
 	DB_MIGRATE_ON_START bool
@@ -124,14 +133,16 @@ func Load() Config {
 	}
 
 	cfg := Config{
-		Env:                getEnv("APP_ENV", "dev"),
-		Port:               getEnv("APP_PORT", "8080"),
-		LogLevel:           getEnv("APP_LOG_LEVEL", "debug"),
-		S3:                 loadS3(),
-		JWT:                loadJWT(),
-		Redis:              loadRedis(),
-		RateLimit:          loadRateLimitConfig(),
-		CORSAllowedOrigins: parseCSV("CORS_ALLOWED_ORIGINS", "*"),
+		Env:       getEnv("APP_ENV", "dev"),
+		Port:      getEnv("APP_PORT", "8080"),
+		LogLevel:  getEnv("APP_LOG_LEVEL", "debug"),
+		S3:        loadS3(),
+		JWT:       loadJWT(),
+		Redis:     loadRedis(),
+		RateLimit: loadRateLimitConfig(),
+		// Fail closed: an unset value means no cross-origin requests are allowed,
+		// rather than silently allowing every origin in production.
+		CORSAllowedOrigins: parseCSV("CORS_ALLOWED_ORIGINS", ""),
 		Google:             loadGoogle(),
 		SMTP:               loadSMTP(),
 	}
@@ -151,6 +162,11 @@ func Load() Config {
 	cfg.DB_CONN_IDLE_TIME = parseDuration("DB_CONN_IDLE_TIME", 9*time.Minute)
 	cfg.DB_SLOW_THRESHOLD = parseDuration("DB_SLOW_THRESHOLD", 200*time.Millisecond)
 
+	// HTTP hardening (defaults: 1 MiB body, 1 MiB headers)
+	cfg.MaxRequestBodyBytes = int64(parseInt("HTTP_MAX_BODY_BYTES", 1<<20))
+	cfg.MaxHeaderBytes = parseInt("HTTP_MAX_HEADER_BYTES", 1<<20)
+	cfg.TrustedProxies = parseCSV("TRUSTED_PROXIES", "")
+
 	return cfg
 }
 
@@ -160,6 +176,7 @@ func loadJWT() JWTConfig {
 	return JWTConfig{
 		SecretKey:          getEnv("JWT_SECRET", "change_me_please"),
 		TokenIssuer:        getEnv("JWT_ISSUER", "YOUR_APP_NAME"),
+		TokenAudience:      getEnv("JWT_AUDIENCE", "YOUR_APP_NAME"),
 		TokenExpiration:    parseDuration("JWT_ACCESS_EXPIRY", 15*time.Minute),
 		RefreshTokenExpiry: parseDuration("JWT_REFRESH_EXPIRY", 168*time.Hour), // 7 days
 	}

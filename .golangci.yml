@@ -1,0 +1,33 @@
+# golangci-lint policy. Keep this in sync with the version pinned in CI
+# (.github/workflows/ci.yml GOLANGCI_LINT_VERSION). If you upgrade to the
+# golangci-lint v2 schema, migrate this file with `golangci-lint migrate`.
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # suspicious constructs
+    - ineffassign   # ineffectual assignments
+    - staticcheck   # broad correctness/bug suite
+    - unused        # unused code
+    - gosimple      # simplifications
+    - bodyclose     # unclosed HTTP response bodies
+    - noctx         # HTTP requests without context
+    - revive        # style / best-practice
+    - misspell      # common misspellings
+    - gosec         # security issues
+    - errorlint     # error-wrapping correctness
+    - rowserrcheck  # sql.Rows.Err not checked
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Tests may use less strict error handling.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec

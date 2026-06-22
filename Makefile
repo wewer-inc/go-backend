@@ -44,6 +44,12 @@ GITLEAKS       ?= $(shell command -v gitleaks 2>/dev/null)
 GOSEC          ?= $(BIN_DIR)/gosec
 GOSEC_FLAGS    ?= -severity medium -confidence medium
 
+# Pinned tool versions — keep in sync with .github/workflows/ci.yml.
+GOLANGCI_VERSION ?= v1.61.0
+STATICCHECK_VERSION ?= 2024.1.1
+GOVULNCHECK_VERSION ?= v1.1.3
+GOSEC_VERSION ?= v2.21.4
+
 # Docker/Compose
 DOCKER         ?= docker
 COMPOSE        ?= docker compose
@@ -121,20 +127,20 @@ help:
 setup: ## Install basic dev deps (Local linting)
 	@mkdir -p $(BIN_DIR)
 	@if [ ! -x "$(BIN_DIR)/golangci-lint" ]; then \
-	echo "$(YELLOW)> installing golangci-lint$(RESET)"; \
-	GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest; \
+	echo "$(YELLOW)> installing golangci-lint $(GOLANGCI_VERSION)$(RESET)"; \
+	GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_VERSION); \
 	fi
 	@if [ ! -x "$(BIN_DIR)/staticcheck" ]; then \
-		echo "$(YELLOW)> installing staticcheck$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install honnef.co/go/tools/cmd/staticcheck@latest; \
+		echo "$(YELLOW)> installing staticcheck $(STATICCHECK_VERSION)$(RESET)"; \
+		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION); \
 	fi
 	@if [ ! -x "$(BIN_DIR)/govulncheck" ]; then \
-		echo "$(YELLOW)> installing govulncheck$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install golang.org/x/vuln/cmd/govulncheck@latest; \
+		echo "$(YELLOW)> installing govulncheck $(GOVULNCHECK_VERSION)$(RESET)"; \
+		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 	fi
 	@if [ ! -x "$(GOSEC)" ]; then \
-		echo "$(YELLOW)> installing gosec$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/securego/gosec/v2/cmd/gosec@latest; \
+		echo "$(YELLOW)> installing gosec $(GOSEC_VERSION)$(RESET)"; \
+		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION); \
 	fi
 	@echo "$(GREEN)✓ setup complete$(RESET)"
 

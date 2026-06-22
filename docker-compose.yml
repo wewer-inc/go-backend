@@ -29,8 +29,9 @@ services:
       DB_SLOW_THRESHOLD: ${DB_SLOW_THRESHOLD:-200ms}
     ports:
       - "8080:8080"
+    # The image is distroless (no shell/wget); probe via the binary's flag.
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "/app/YOUR_APP_NAME", "-healthcheck"]
       interval: 5s
       timeout: 2s
       retries: 15

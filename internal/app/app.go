@@ -20,14 +20,15 @@ import (
 )
 
 type App struct {
-	cfg         config.Config
-	log         zerolog.Logger
-	srv         *http.Server
-	db          *gorm.DB
-	ObjectStore objectstore.Store
-	Redis       *redisstore.Client
-	Mailer      email.Mailer
-	Worker      *worker.Worker
+	cfg          config.Config
+	log          zerolog.Logger
+	srv          *http.Server
+	db           *gorm.DB
+	ObjectStore  objectstore.Store
+	Redis        *redisstore.Client
+	Mailer       email.Mailer
+	Worker       *worker.Worker
+	workerCancel context.CancelFunc
 }
 
 // Build wires all dependencies and returns a ready-to-start App.
@@ -97,6 +98,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		DB:       gdb,
 		ObjStore: s3Store,
 		Redis:    redisClient,
+		Worker:   w,
 	}
 
 	handler := httpserver.NewRouter(deps, build)
@@ -108,6 +110,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 
 	return &App{
@@ -125,8 +128,11 @@ func Build(build versioning.BuildInfo) (*App, error) {
 func (a *App) Start() error {
 	a.log.Info().Str("addr", a.srv.Addr).Msg("http: listening")
 
-	// Start background worker pool
-	a.Worker.Start(context.Background())
+	// Start background worker pool with an app-scoped context so in-flight jobs
+	// observe shutdown via cancellation.
+	workerCtx, cancel := context.WithCancel(context.Background())
+	a.workerCancel = cancel
+	a.Worker.Start(workerCtx)
 
 	go func() {
 		if err := a.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) && err != nil {
@@ -154,10 +160,18 @@ func (a *App) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Drain worker queue
+	// Drain worker queue, bounded by the shutdown deadline.
 	if a.Worker != nil {
-		a.Worker.Stop()
-		a.log.Info().Msg("worker: drained")
+		if err := a.Worker.Stop(ctx); err != nil {
+			a.log.Error().Err(err).Msg("worker: drain did not complete within shutdown deadline")
+			errs = append(errs, err)
+		} else {
+			a.log.Info().Msg("worker: drained")
+		}
+	}
+	// Release any straggler jobs still holding the worker context.
+	if a.workerCancel != nil {
+		a.workerCancel()
 	}
 
 	if a.db != nil {

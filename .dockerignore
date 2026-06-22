@@ -1,0 +1,32 @@
+# Keep the build context small and free of secrets / local cruft.
+# Secrets — never ship these into the build context or image layers.
+.env
+.env.*
+!.env.example
+
+# VCS / CI
+.git
+.github
+.gitignore
+.gitleaks.toml
+
+# Local build & tooling output
+.bin
+.build
+.coverage
+reports
+*.out
+*.test
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+
+# Docs & meta (not needed in the image)
+*.md
+LICENSE
+NOTICE
+docker-compose.yml
+Makefile
+scripts
