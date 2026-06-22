@@ -2,6 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +34,14 @@ const refreshTokenPrefix = "refresh_token:"
 // session can be revoked independently of the rest.
 func refreshKey(sub, jti string) string {
 	return refreshTokenPrefix + sub + ":" + jti
+}
+
+// hashRefreshToken returns a hex SHA-256 of the refresh token. Only the hash is
+// stored server-side, so a Redis snapshot/dump never exposes usable bearer
+// tokens.
+func hashRefreshToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // Service handles authentication business logic.
@@ -136,8 +147,17 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*Auth
 	}
 
 	key := refreshKey(claims.Subject, claims.JTI)
-	stored, err := s.redis.Get(ctx, key).Result()
-	if err != nil || stored != refreshToken {
+
+	// Atomically fetch-and-delete the stored hash. GETDEL makes rotation
+	// race-free: of two concurrent refreshes for the same token, only one sees
+	// the value — the other gets redis.Nil and is rejected, so a single refresh
+	// token can never mint two live sessions.
+	stored, err := s.redis.GetDel(ctx, key).Result()
+	if err != nil {
+		return nil, apierr.Unauthorized("refresh token not recognised")
+	}
+	// Constant-time compare against the presented token's hash.
+	if subtle.ConstantTimeCompare([]byte(stored), []byte(hashRefreshToken(refreshToken))) != 1 {
 		return nil, apierr.Unauthorized("refresh token not recognised")
 	}
 
@@ -150,9 +170,6 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*Auth
 	if err != nil {
 		return nil, apierr.Unauthorized("user not found")
 	}
-
-	// Rotate: invalidate this session's old refresh token before issuing a new pair.
-	s.redis.Del(ctx, key)
 
 	return s.issueTokenPair(ctx, u)
 }
@@ -258,10 +275,11 @@ func (s *Service) issueTokenPair(ctx context.Context, u *user.User) (*AuthRespon
 		return nil, apierr.Internal("failed to issue refresh token")
 	}
 
-	// Store the refresh token under a per-session key so concurrent sessions
-	// (multiple devices) coexist and can be revoked individually.
+	// Store only the hash of the refresh token under a per-session key so
+	// concurrent sessions (multiple devices) coexist and can be revoked
+	// individually, and a Redis dump never leaks usable tokens.
 	key := refreshKey(uuidStr, refresh.JTI)
-	if err := s.redis.Set(ctx, key, refresh.Token, s.jwtCfg.RefreshTokenExpiry).Err(); err != nil {
+	if err := s.redis.Set(ctx, key, hashRefreshToken(refresh.Token), s.jwtCfg.RefreshTokenExpiry).Err(); err != nil {
 		return nil, apierr.Internal("failed to store refresh token")
 	}
 

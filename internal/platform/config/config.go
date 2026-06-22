@@ -39,12 +39,21 @@ type GoogleOAuthConfig struct {
 	RedirectURL  string
 }
 
+// SMTPMode selects how the connection to the SMTP server is secured.
+type SMTPMode string
+
+const (
+	SMTPStartTLS    SMTPMode = "starttls"     // plaintext connect, upgrade via STARTTLS (port 587)
+	SMTPImplicitTLS SMTPMode = "implicit_tls" // TLS from the first byte (port 465)
+	SMTPPlain       SMTPMode = "plain"        // no encryption — DEV ONLY, never authenticates
+)
+
 type SMTPConfig struct {
 	Host     string
 	Port     int
 	From     string
 	Password string
-	UseTLS   bool
+	Mode     SMTPMode
 }
 
 type RedisConfig struct {
@@ -83,6 +92,17 @@ type Config struct {
 
 	// Ready Checks Timeout Period
 	ReadyCheckTimeout time.Duration // default to 3 seconds for now
+
+	// --- Dependency toggles ---
+	// Whether optional backing services are wired at startup. DB is always
+	// required. Disabling Redis turns off auth/rate-limit/revocation features.
+	S3Enabled    bool
+	RedisEnabled bool
+
+	// When the revocation store (Redis) cannot be queried: true accepts the
+	// token (favours availability), false rejects with 503 (favours revocation
+	// guarantees). Defaults to false — fail closed.
+	AuthRevocationFailOpen bool
 
 	// --- HTTP hardening ---
 	MaxRequestBodyBytes int64 // cap on request body size; 0 disables
@@ -167,6 +187,12 @@ func Load() Config {
 	cfg.MaxHeaderBytes = parseInt("HTTP_MAX_HEADER_BYTES", 1<<20)
 	cfg.TrustedProxies = parseCSV("TRUSTED_PROXIES", "")
 
+	// Dependency toggles. S3 is off by default (no local default), Redis is on
+	// (auth needs it) and the default Compose stack starts it.
+	cfg.S3Enabled = parseBool("S3_ENABLED", false)
+	cfg.RedisEnabled = parseBool("REDIS_ENABLED", true)
+	cfg.AuthRevocationFailOpen = parseBool("AUTH_REVOCATION_FAIL_OPEN", false)
+
 	return cfg
 }
 
@@ -225,7 +251,7 @@ func loadSMTP() SMTPConfig {
 		Port:     parseInt("SMTP_PORT", 587),
 		From:     getEnv("SMTP_FROM", ""),
 		Password: getEnv("SMTP_PASSWORD", ""),
-		UseTLS:   parseBool("SMTP_USE_TLS", false),
+		Mode:     SMTPMode(getEnv("SMTP_MODE", string(SMTPStartTLS))),
 	}
 }
 

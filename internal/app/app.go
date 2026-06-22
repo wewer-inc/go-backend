@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -51,39 +52,57 @@ func Build(build versioning.BuildInfo) (*App, error) {
 
 	ctx := context.Background()
 
-	s3Store, err := objectstore.NewS3Store(ctx, cfg.S3)
-	if err != nil {
-		return nil, err
+	// S3 is optional: only wired when explicitly enabled.
+	var s3Store objectstore.Store
+	if cfg.S3Enabled {
+		st, err := objectstore.NewS3Store(ctx, cfg.S3)
+		if err != nil {
+			return nil, err
+		}
+		hcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = st.HealthCheck(hcCtx)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("s3: health check failed")
+			return nil, err
+		}
+		s3Store = st
+	} else {
+		log.Info().Msg("s3: disabled (S3_ENABLED=false)")
 	}
 
-	hcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := s3Store.HealthCheck(hcCtx); err != nil {
-		log.Error().Err(err).Msg("s3: health check failed")
-		return nil, err
+	// Redis is optional, but auth, rate limiting and token revocation require it.
+	var redisClient *redisstore.Client
+	if cfg.RedisEnabled {
+		rc, err := redisstore.NewClient(cfg.Redis)
+		if err != nil {
+			return nil, err
+		}
+		redisCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		err = rc.HealthCheck(redisCtx)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("redis: health check failed")
+			return nil, err
+		}
+		redisClient = rc
+	} else {
+		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — auth, rate limiting and token revocation are unavailable")
 	}
 
-	redisClient, err := redisstore.NewClient(cfg.Redis)
-	if err != nil {
-		return nil, err
-	}
-
-	redisCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-	if err := redisClient.HealthCheck(redisCtx); err != nil {
-		log.Error().Err(err).Msg("redis: health check failed")
-		return nil, err
-	}
-
-	// Email: use SMTP in prod, noop in dev
+	// Email: real SMTP when a host is configured, noop otherwise. Production
+	// must not transmit credentials in the clear.
 	var mailer email.Mailer
-	if cfg.Env == "prod" && cfg.SMTP.Host != "" {
+	if cfg.SMTP.Host != "" {
+		if cfg.Env == "prod" && cfg.SMTP.Mode == config.SMTPPlain {
+			return nil, fmt.Errorf("smtp: plaintext mode is not allowed in prod; set SMTP_MODE=starttls or implicit_tls")
+		}
 		mailer = email.NewSMTPMailer(email.Config{
 			Host:     cfg.SMTP.Host,
 			Port:     cfg.SMTP.Port,
 			From:     cfg.SMTP.From,
 			Password: cfg.SMTP.Password,
-			UseTLS:   cfg.SMTP.UseTLS,
+			Mode:     cfg.SMTP.Mode,
 		})
 	} else {
 		mailer = email.NewNoopMailer(log)
@@ -101,7 +120,10 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		Worker:   w,
 	}
 
-	handler := httpserver.NewRouter(deps, build)
+	handler, err := httpserver.NewRouter(deps, build)
+	if err != nil {
+		return nil, err
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

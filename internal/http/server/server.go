@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -19,7 +20,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-func NewRouter(deps Deps, build versioning.BuildInfo) http.Handler {
+func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 	if deps.Cfg.Env == "prod" {
 		gin.SetMode(gin.ReleaseMode)
 	} else {
@@ -30,8 +31,11 @@ func NewRouter(deps Deps, build versioning.BuildInfo) http.Handler {
 
 	// Trusted proxies: only honour X-Forwarded-For from these hops when deriving
 	// ClientIP. Empty list => XFF is ignored (ClientIP == direct peer), which is
-	// the safe default for the rate limiter.
-	_ = r.SetTrustedProxies(deps.Cfg.TrustedProxies)
+	// the safe default for the rate limiter. A malformed CIDR here must fail the
+	// build rather than silently leave gin on an unsafe default.
+	if err := r.SetTrustedProxies(deps.Cfg.TrustedProxies); err != nil {
+		return nil, fmt.Errorf("http: invalid TRUSTED_PROXIES: %w", err)
+	}
 
 	r.Use(gin.Recovery())
 	r.Use(
@@ -121,8 +125,9 @@ func NewRouter(deps Deps, build versioning.BuildInfo) http.Handler {
 
 	// Authenticated group. Rate limiting is applied AFTER UserAuth so the limit
 	// is keyed by user id (not the shared NAT/proxy IP).
+	failOpen := deps.Cfg.AuthRevocationFailOpen
 	secured := v1.Group("")
-	secured.Use(middleware.UserAuth(jwtVerifier, userRepo, rawRedis))
+	secured.Use(middleware.UserAuth(jwtVerifier, userRepo, rawRedis, failOpen))
 	if rl != nil {
 		secured.Use(rl.Global())
 	}
@@ -142,12 +147,12 @@ func NewRouter(deps Deps, build versioning.BuildInfo) http.Handler {
 	// Admin routes: AdminAuth first (sets identity), then the admin bucket so it
 	// is user-keyed.
 	admin := v1.Group("/admin")
-	admin.Use(middleware.AdminAuth(jwtVerifier, userRepo, rawRedis))
+	admin.Use(middleware.AdminAuth(jwtVerifier, userRepo, rawRedis, failOpen))
 	if rl != nil {
 		admin.Use(rl.Admin())
 	}
 
-	return r
+	return r, nil
 }
 
 func containsWildcard(origins []string) bool {

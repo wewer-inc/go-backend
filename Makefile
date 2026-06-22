@@ -218,15 +218,10 @@ run: ## Run the application
 # ====== Docker workflow ======
 # ====== Docker / Compose targets ======
 export COMPOSE_PROJECT_NAME ?= $(COMPOSE_PROJECT_NAME)  # ensure compose picks it up
-DB_PROFILE ?= false
 
 .PHONY: docker-up
-docker-up: ## Up via compose (db+cache opt-in: make docker-up DB_PROFILE=true)
-ifeq ($(DB_PROFILE),true)
-	$(COMPOSE) --profile db --profile cache up --build -d
-else
+docker-up: ## Up via compose (starts api + postgres + redis)
 	$(COMPOSE) up --build -d
-endif
 	$(COMPOSE) ps
 
 

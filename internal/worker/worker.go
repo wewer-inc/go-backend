@@ -14,6 +14,9 @@ import (
 // can decide whether to drop, retry, or surface an error to the user.
 var ErrQueueFull = errors.New("worker: queue full")
 
+// ErrStopped is returned by Enqueue after the worker has begun shutting down.
+var ErrStopped = errors.New("worker: stopped")
+
 var jobsDropped = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "worker_jobs_dropped_total",
 	Help: "Number of jobs dropped because the worker queue was full.",
@@ -28,6 +31,9 @@ type Worker struct {
 	concurrency int
 	log         zerolog.Logger
 	wg          sync.WaitGroup
+
+	mu     sync.Mutex // guards closed and serialises sends against close
+	closed bool
 }
 
 // New creates a Worker with the given concurrency and queue capacity.
@@ -65,8 +71,17 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 // Enqueue submits a job. It is non-blocking; if the queue is full it returns
-// ErrQueueFull (and records the drop) rather than blocking the caller.
+// ErrQueueFull, and once the worker is stopping it returns ErrStopped. The
+// mutex serialises the send with Stop's close so a job can never be sent on a
+// closed channel.
 func (w *Worker) Enqueue(job Job) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrStopped
+	}
+
 	select {
 	case w.queue <- job:
 		return nil
@@ -79,9 +94,17 @@ func (w *Worker) Enqueue(job Job) error {
 
 // Stop stops accepting new jobs and waits for in-flight jobs to finish, bounded
 // by ctx. If ctx is cancelled (e.g. the shutdown deadline elapses) before the
-// pool drains, Stop returns ctx.Err() rather than blocking forever.
+// pool drains, Stop returns ctx.Err() rather than blocking forever. Safe to
+// call more than once.
 func (w *Worker) Stop(ctx context.Context) error {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
+	w.closed = true
 	close(w.queue)
+	w.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {

@@ -8,6 +8,7 @@ import (
 	"net/smtp"
 	"time"
 
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
 	"github.com/rs/zerolog"
 )
 
@@ -22,7 +23,7 @@ type Config struct {
 	Port     int
 	From     string
 	Password string
-	UseTLS   bool
+	Mode     config.SMTPMode
 }
 
 const (
@@ -36,6 +37,9 @@ type SMTPMailer struct {
 }
 
 func NewSMTPMailer(cfg Config) *SMTPMailer {
+	if cfg.Mode == "" {
+		cfg.Mode = config.SMTPStartTLS
+	}
 	return &SMTPMailer{cfg: cfg}
 }
 
@@ -77,7 +81,7 @@ func (m *SMTPMailer) Send(ctx context.Context, to, subject, htmlBody string) err
 
 func (m *SMTPMailer) sendOnce(ctx context.Context, to, subject, htmlBody string) error {
 	addr := fmt.Sprintf("%s:%d", m.cfg.Host, m.cfg.Port)
-	auth := smtp.PlainAuth("", m.cfg.From, m.cfg.Password, m.cfg.Host)
+	tlsCfg := &tls.Config{ServerName: m.cfg.Host, MinVersion: tls.VersionTLS12}
 
 	msg := []byte(
 		"From: " + m.cfg.From + "\r\n" +
@@ -91,17 +95,18 @@ func (m *SMTPMailer) sendOnce(ctx context.Context, to, subject, htmlBody string)
 
 	// Dial with the context so connection setup respects the deadline.
 	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("smtp dial: %w", err)
 	}
 	// Apply the context deadline to all subsequent socket I/O.
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+		_ = rawConn.SetDeadline(deadline)
 	}
 
-	if m.cfg.UseTLS {
-		conn = tls.Client(conn, &tls.Config{ServerName: m.cfg.Host, MinVersion: tls.VersionTLS12})
+	var conn net.Conn = rawConn
+	if m.cfg.Mode == config.SMTPImplicitTLS {
+		conn = tls.Client(rawConn, tlsCfg)
 	}
 
 	client, err := smtp.NewClient(conn, m.cfg.Host)
@@ -111,9 +116,30 @@ func (m *SMTPMailer) sendOnce(ctx context.Context, to, subject, htmlBody string)
 	}
 	defer client.Close()
 
-	if err := client.Auth(auth); err != nil {
-		return fmt.Errorf("smtp auth: %w", err)
+	// For STARTTLS, upgrade the plaintext connection before doing anything that
+	// transmits credentials. Refuse to continue if the server won't upgrade.
+	secured := m.cfg.Mode == config.SMTPImplicitTLS
+	if m.cfg.Mode == config.SMTPStartTLS {
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return fmt.Errorf("smtp: server does not advertise STARTTLS (mode=%s)", m.cfg.Mode)
+		}
+		if err := client.StartTLS(tlsCfg); err != nil {
+			return fmt.Errorf("smtp starttls: %w", err)
+		}
+		secured = true
 	}
+
+	// Never send credentials over an unencrypted connection.
+	if m.cfg.Password != "" {
+		if !secured {
+			return fmt.Errorf("smtp: refusing to authenticate over plaintext (mode=%s); use starttls or implicit_tls", m.cfg.Mode)
+		}
+		auth := smtp.PlainAuth("", m.cfg.From, m.cfg.Password, m.cfg.Host)
+		if err := client.Auth(auth); err != nil {
+			return fmt.Errorf("smtp auth: %w", err)
+		}
+	}
+
 	if err := client.Mail(m.cfg.From); err != nil {
 		return fmt.Errorf("smtp mail: %w", err)
 	}

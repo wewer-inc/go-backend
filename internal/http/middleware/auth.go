@@ -22,11 +22,14 @@ const (
 )
 
 // UserAuth validates a JWT access token and loads the user into context.
-// redis may be nil (revocation checks are then skipped).
+// redis may be nil (revocation checks are then skipped). revocationFailOpen
+// decides behaviour when the revocation store cannot be queried: true accepts
+// the token, false rejects with 503.
 func UserAuth(
 	verifier auth.Verifier,
 	userRepo repo.Repo[user.User],
 	redis *goredis.Client,
+	revocationFailOpen bool,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
@@ -56,7 +59,14 @@ func UserAuth(
 
 		// Revocation check: a logged-out access token is denylisted by jti.
 		if redis != nil && claims.JTI != "" {
-			if n, err := redis.Exists(c.Request.Context(), auth.DenylistKey(claims.JTI)).Result(); err == nil && n > 0 {
+			n, err := redis.Exists(c.Request.Context(), auth.DenylistKey(claims.JTI)).Result()
+			switch {
+			case err != nil && !revocationFailOpen:
+				// Fail closed: cannot prove the token is still valid.
+				c.JSON(http.StatusServiceUnavailable, apicommon.Response[any]{Error: "auth_unavailable", Message: "revocation store unavailable"})
+				c.Abort()
+				return
+			case err == nil && n > 0:
 				unauthorized(c, "token revoked")
 				return
 			}
@@ -88,8 +98,9 @@ func AdminAuth(
 	verifier auth.Verifier,
 	userRepo repo.Repo[user.User],
 	redis *goredis.Client,
+	revocationFailOpen bool,
 ) gin.HandlerFunc {
-	userAuth := UserAuth(verifier, userRepo, redis)
+	userAuth := UserAuth(verifier, userRepo, redis, revocationFailOpen)
 
 	return func(c *gin.Context) {
 		userAuth(c)
