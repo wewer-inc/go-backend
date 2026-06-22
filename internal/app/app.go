@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -148,6 +149,12 @@ func Build(build versioning.BuildInfo) (*App, error) {
 }
 
 func (a *App) Start() error {
+	// Bind the listener synchronously so a bind failure (e.g. port in use) is
+	// returned to the caller instead of only being logged from a goroutine.
+	ln, err := net.Listen("tcp", a.srv.Addr)
+	if err != nil {
+		return fmt.Errorf("http: listen %s: %w", a.srv.Addr, err)
+	}
 	a.log.Info().Str("addr", a.srv.Addr).Msg("http: listening")
 
 	// Start background worker pool with an app-scoped context so in-flight jobs
@@ -157,7 +164,7 @@ func (a *App) Start() error {
 	a.Worker.Start(workerCtx)
 
 	go func() {
-		if err := a.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) && err != nil {
+		if err := a.srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) && err != nil {
 			a.log.Error().Err(err).Msg("http: server error")
 		}
 	}()

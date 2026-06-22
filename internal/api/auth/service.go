@@ -176,19 +176,37 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*Auth
 
 // Logout revokes the current session: it denylists the presented access token
 // (by jti, until it would have expired) and deletes the refresh session so it
-// can no longer be exchanged.
+// can no longer be exchanged. The optional refresh token must belong to the
+// same subject as the access token — a user cannot revoke someone else's session.
 func (s *Service) Logout(ctx context.Context, accessClaims *platformauth.Claims, refreshToken string) error {
-	if accessClaims != nil && accessClaims.JTI != "" {
+	if accessClaims == nil {
+		return apierr.Unauthorized("missing authentication")
+	}
+
+	// Revoke the access token. This is a guarantee, not best-effort: if the
+	// denylist write fails, logout fails so the caller knows the token is still
+	// live.
+	if accessClaims.JTI != "" {
 		ttl := time.Until(accessClaims.ExpiresAt)
 		if ttl > 0 {
-			// Best-effort: a failure here must not leave the user unable to log out.
-			_ = s.redis.Set(ctx, platformauth.DenylistKey(accessClaims.JTI), "1", ttl).Err()
+			if err := s.redis.Set(ctx, platformauth.DenylistKey(accessClaims.JTI), "1", ttl).Err(); err != nil {
+				return apierr.Internal("failed to revoke access token")
+			}
 		}
 	}
 
 	if refreshToken != "" {
-		if rc, err := s.verifier.Verify(refreshToken); err == nil && rc.TokenUse == platformauth.UseRefresh {
-			s.redis.Del(ctx, refreshKey(rc.Subject, rc.JTI))
+		rc, err := s.verifier.Verify(refreshToken)
+		// Ignore a malformed/expired refresh token — access revocation already
+		// happened. But a *valid* token for another subject is an attempt to
+		// revoke a session that isn't the caller's: reject it.
+		if err == nil && rc.TokenUse == platformauth.UseRefresh {
+			if rc.Subject != accessClaims.Subject {
+				return apierr.Forbidden("refresh token does not belong to the authenticated user")
+			}
+			if err := s.redis.Del(ctx, refreshKey(rc.Subject, rc.JTI)).Err(); err != nil {
+				return apierr.Internal("failed to revoke refresh session")
+			}
 		}
 	}
 
