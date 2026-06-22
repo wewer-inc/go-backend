@@ -104,7 +104,7 @@ func (m *SMTPMailer) sendOnce(ctx context.Context, to, subject, htmlBody string)
 		_ = rawConn.SetDeadline(deadline)
 	}
 
-	var conn net.Conn = rawConn
+	conn := rawConn
 	if m.cfg.Mode == config.SMTPImplicitTLS {
 		conn = tls.Client(rawConn, tlsCfg)
 	}
@@ -114,7 +114,7 @@ func (m *SMTPMailer) sendOnce(ctx context.Context, to, subject, htmlBody string)
 		_ = conn.Close()
 		return fmt.Errorf("smtp client: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// For STARTTLS, upgrade the plaintext connection before doing anything that
 	// transmits credentials. Refuse to continue if the server won't upgrade.

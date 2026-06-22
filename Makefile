@@ -44,11 +44,12 @@ GITLEAKS       ?= $(shell command -v gitleaks 2>/dev/null)
 GOSEC          ?= $(BIN_DIR)/gosec
 GOSEC_FLAGS    ?= -severity medium -confidence medium
 
-# Pinned tool versions — keep in sync with .github/workflows/ci.yml.
-GOLANGCI_VERSION ?= v1.61.0
-STATICCHECK_VERSION ?= 2024.1.1
-GOVULNCHECK_VERSION ?= v1.1.3
-GOSEC_VERSION ?= v2.21.4
+# Pinned tool versions — keep in sync with .github/workflows/ci.yml. Must
+# support the Go toolchain in go.mod (older releases fail to build on newer Go).
+GOLANGCI_VERSION ?= v2.12.2
+STATICCHECK_VERSION ?= 2026.1
+GOVULNCHECK_VERSION ?= v1.2.0
+GOSEC_VERSION ?= v2.27.1
 
 # Docker/Compose
 DOCKER         ?= docker
@@ -128,7 +129,7 @@ setup: ## Install basic dev deps (Local linting)
 	@mkdir -p $(BIN_DIR)
 	@if [ ! -x "$(BIN_DIR)/golangci-lint" ]; then \
 	echo "$(YELLOW)> installing golangci-lint $(GOLANGCI_VERSION)$(RESET)"; \
-	GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_VERSION); \
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_VERSION)/install.sh | sh -s -- -b $(CURDIR)/$(BIN_DIR) $(GOLANGCI_VERSION); \
 	fi
 	@if [ ! -x "$(BIN_DIR)/staticcheck" ]; then \
 		echo "$(YELLOW)> installing staticcheck $(STATICCHECK_VERSION)$(RESET)"; \
@@ -140,7 +141,7 @@ setup: ## Install basic dev deps (Local linting)
 	fi
 	@if [ ! -x "$(GOSEC)" ]; then \
 		echo "$(YELLOW)> installing gosec $(GOSEC_VERSION)$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION); \
+		curl -sSfL https://raw.githubusercontent.com/securego/gosec/$(GOSEC_VERSION)/install.sh | sh -s -- -b $(CURDIR)/$(BIN_DIR) $(GOSEC_VERSION); \
 	fi
 	@echo "$(GREEN)✓ setup complete$(RESET)"
 

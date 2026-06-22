@@ -63,13 +63,22 @@ func runHealthcheck() int {
 		port = "8080"
 	}
 
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:" + port + "/health")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// URL is a fixed localhost probe; port comes from our own config (not user input).
+	url := "http://127.0.0.1:" + port + "/health"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G704 -- localhost probe
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck:", err)
 		return 1
 	}
-	defer resp.Body.Close()
+	resp, err := http.DefaultClient.Do(req) // #nosec G704 -- localhost probe
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintln(os.Stderr, "healthcheck: status", resp.StatusCode)

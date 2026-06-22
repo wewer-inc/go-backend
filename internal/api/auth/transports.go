@@ -1,7 +1,8 @@
 package auth
 
-// Password is capped at 72 bytes because bcrypt silently truncates input beyond
-// that length — without the cap, the tail of a long password is ignored.
+// RegisterRequest caps Password at 72 bytes because bcrypt silently truncates
+// input beyond that length — without the cap, the tail of a long password is
+// ignored.
 type RegisterRequest struct {
 	Name     string `json:"name"     binding:"required"`
 	Email    string `json:"email"    binding:"required,email"`

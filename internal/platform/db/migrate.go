@@ -8,7 +8,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func UpMigrations(gdb *gorm.DB, log zerolog.Logger) error {
+func UpMigrations(gdb *gorm.DB, _ zerolog.Logger) error {
 	m := gormigrate.New(gdb, gormigrate.DefaultOptions, migrations())
 	return m.Migrate()
 }
