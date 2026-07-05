@@ -9,25 +9,39 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// RegisterRoutes wires auth endpoints onto the provided router group.
-// v1 is the unprotected /v1 group (no JWT required for login/register).
+// RegisterRoutes wires auth endpoints.
+//   - v1 is the unprotected /v1 group (login/register/refresh need no JWT).
+//   - secured is the authenticated group (UserAuth applied) used for logout.
+//   - authLimit, if non-nil, is a stricter rate-limit middleware applied only to
+//     the brute-force-sensitive public auth endpoints.
 func RegisterRoutes(
 	v1 *gin.RouterGroup,
+	secured *gin.RouterGroup,
 	cfg config.Config,
 	userRepo repo.Repo[user.User],
 	issuer platformauth.Issuer,
 	verifier platformauth.Verifier,
 	redis *goredis.Client,
+	authLimit gin.HandlerFunc,
 ) {
 	svc := NewService(userRepo, issuer, verifier, redis, cfg)
-	h := NewHandler(svc)
+	h := NewHandler(svc, cfg.Env == "prod")
 
-	auth := v1.Group("/auth")
+	pub := v1.Group("/auth")
+	if authLimit != nil {
+		pub.Use(authLimit)
+	}
 	{
-		auth.POST("/register", h.Register)
-		auth.POST("/login", h.Login)
-		auth.POST("/refresh", h.Refresh)
-		auth.GET("/google", h.GoogleRedirect)
-		auth.GET("/google/callback", h.GoogleCallback)
+		pub.POST("/register", h.Register)
+		pub.POST("/login", h.Login)
+		pub.POST("/refresh", h.Refresh)
+		pub.GET("/google", h.GoogleRedirect)
+		pub.GET("/google/callback", h.GoogleCallback)
+	}
+
+	// Authenticated auth endpoints.
+	sec := secured.Group("/auth")
+	{
+		sec.POST("/logout", h.Logout)
 	}
 }

@@ -1,9 +1,12 @@
 package auth
 
+// RegisterRequest caps Password at 72 bytes because bcrypt silently truncates
+// input beyond that length — without the cap, the tail of a long password is
+// ignored.
 type RegisterRequest struct {
 	Name     string `json:"name"     binding:"required"`
 	Email    string `json:"email"    binding:"required,email"`
-	Password string `json:"password" binding:"required,min=8"`
+	Password string `json:"password" binding:"required,min=8,max=72"`
 }
 
 type LoginRequest struct {
@@ -13,6 +16,11 @@ type LoginRequest struct {
 
 type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
+type LogoutRequest struct {
+	// Optional: when provided, this refresh session is also revoked.
+	RefreshToken string `json:"refresh_token"`
 }
 
 type TokenPairResponse struct {

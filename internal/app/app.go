@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -20,14 +22,15 @@ import (
 )
 
 type App struct {
-	cfg         config.Config
-	log         zerolog.Logger
-	srv         *http.Server
-	db          *gorm.DB
-	ObjectStore objectstore.Store
-	Redis       *redisstore.Client
-	Mailer      email.Mailer
-	Worker      *worker.Worker
+	cfg          config.Config
+	log          zerolog.Logger
+	srv          *http.Server
+	db           *gorm.DB
+	ObjectStore  objectstore.Store
+	Redis        *redisstore.Client
+	Mailer       email.Mailer
+	Worker       *worker.Worker
+	workerCancel context.CancelFunc
 }
 
 // Build wires all dependencies and returns a ready-to-start App.
@@ -50,39 +53,57 @@ func Build(build versioning.BuildInfo) (*App, error) {
 
 	ctx := context.Background()
 
-	s3Store, err := objectstore.NewS3Store(ctx, cfg.S3)
-	if err != nil {
-		return nil, err
+	// S3 is optional: only wired when explicitly enabled.
+	var s3Store objectstore.Store
+	if cfg.S3Enabled {
+		st, err := objectstore.NewS3Store(ctx, cfg.S3)
+		if err != nil {
+			return nil, err
+		}
+		hcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = st.HealthCheck(hcCtx)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("s3: health check failed")
+			return nil, err
+		}
+		s3Store = st
+	} else {
+		log.Info().Msg("s3: disabled (S3_ENABLED=false)")
 	}
 
-	hcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := s3Store.HealthCheck(hcCtx); err != nil {
-		log.Error().Err(err).Msg("s3: health check failed")
-		return nil, err
+	// Redis is optional, but auth, rate limiting and token revocation require it.
+	var redisClient *redisstore.Client
+	if cfg.RedisEnabled {
+		rc, err := redisstore.NewClient(cfg.Redis)
+		if err != nil {
+			return nil, err
+		}
+		redisCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		err = rc.HealthCheck(redisCtx)
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("redis: health check failed")
+			return nil, err
+		}
+		redisClient = rc
+	} else {
+		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — auth, rate limiting and token revocation are unavailable")
 	}
 
-	redisClient, err := redisstore.NewClient(cfg.Redis)
-	if err != nil {
-		return nil, err
-	}
-
-	redisCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-	if err := redisClient.HealthCheck(redisCtx); err != nil {
-		log.Error().Err(err).Msg("redis: health check failed")
-		return nil, err
-	}
-
-	// Email: use SMTP in prod, noop in dev
+	// Email: real SMTP when a host is configured, noop otherwise. Production
+	// must not transmit credentials in the clear.
 	var mailer email.Mailer
-	if cfg.Env == "prod" && cfg.SMTP.Host != "" {
+	if cfg.SMTP.Host != "" {
+		if cfg.Env == "prod" && cfg.SMTP.Mode == config.SMTPPlain {
+			return nil, fmt.Errorf("smtp: plaintext mode is not allowed in prod; set SMTP_MODE=starttls or implicit_tls")
+		}
 		mailer = email.NewSMTPMailer(email.Config{
 			Host:     cfg.SMTP.Host,
 			Port:     cfg.SMTP.Port,
 			From:     cfg.SMTP.From,
 			Password: cfg.SMTP.Password,
-			UseTLS:   cfg.SMTP.UseTLS,
+			Mode:     cfg.SMTP.Mode,
 		})
 	} else {
 		mailer = email.NewNoopMailer(log)
@@ -97,9 +118,13 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		DB:       gdb,
 		ObjStore: s3Store,
 		Redis:    redisClient,
+		Worker:   w,
 	}
 
-	handler := httpserver.NewRouter(deps, build)
+	handler, err := httpserver.NewRouter(deps, build)
+	if err != nil {
+		return nil, err
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -108,6 +133,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 
 	return &App{
@@ -123,13 +149,23 @@ func Build(build versioning.BuildInfo) (*App, error) {
 }
 
 func (a *App) Start() error {
+	// Bind the listener synchronously so a bind failure (e.g. port in use) is
+	// returned to the caller instead of only being logged from a goroutine.
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", a.srv.Addr)
+	if err != nil {
+		return fmt.Errorf("http: listen %s: %w", a.srv.Addr, err)
+	}
 	a.log.Info().Str("addr", a.srv.Addr).Msg("http: listening")
 
-	// Start background worker pool
-	a.Worker.Start(context.Background())
+	// Start background worker pool with an app-scoped context so in-flight jobs
+	// observe shutdown via cancellation.
+	workerCtx, cancel := context.WithCancel(context.Background())
+	a.workerCancel = cancel
+	a.Worker.Start(workerCtx)
 
 	go func() {
-		if err := a.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) && err != nil {
+		if err := a.srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) && err != nil {
 			a.log.Error().Err(err).Msg("http: server error")
 		}
 	}()
@@ -154,10 +190,18 @@ func (a *App) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Drain worker queue
+	// Drain worker queue, bounded by the shutdown deadline.
 	if a.Worker != nil {
-		a.Worker.Stop()
-		a.log.Info().Msg("worker: drained")
+		if err := a.Worker.Stop(ctx); err != nil {
+			a.log.Error().Err(err).Msg("worker: drain did not complete within shutdown deadline")
+			errs = append(errs, err)
+		} else {
+			a.log.Info().Msg("worker: drained")
+		}
+	}
+	// Release any straggler jobs still holding the worker context.
+	if a.workerCancel != nil {
+		a.workerCancel()
 	}
 
 	if a.db != nil {

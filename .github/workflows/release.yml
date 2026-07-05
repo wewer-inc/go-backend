@@ -13,6 +13,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write # keyless cosign signing via OIDC
 
     steps:
       - name: Checkout
@@ -43,6 +44,9 @@ jobs:
             -o YOUR_APP_NAME \
             ./cmd/server
 
+      - name: Checksums
+        run: sha256sum YOUR_APP_NAME > YOUR_APP_NAME.sha256
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -50,22 +54,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Docker metadata (tags + OCI labels)
+        id: docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             COMMIT=${{ steps.meta.outputs.commit }}
             DATE=${{ steps.meta.outputs.date }}
 
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: YOUR_APP_NAME
+          files: |
+            YOUR_APP_NAME
+            YOUR_APP_NAME.sha256
+            sbom.spdx.json
           generate_release_notes: true
           draft: false

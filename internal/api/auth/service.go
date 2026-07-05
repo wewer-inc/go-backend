@@ -2,11 +2,15 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
@@ -24,6 +28,21 @@ import (
 )
 
 const refreshTokenPrefix = "refresh_token:"
+
+// refreshKey scopes a refresh token to a single session (sub + jti) so that
+// logging in on a second device does not invalidate the first, and a single
+// session can be revoked independently of the rest.
+func refreshKey(sub, jti string) string {
+	return refreshTokenPrefix + sub + ":" + jti
+}
+
+// hashRefreshToken returns a hex SHA-256 of the refresh token. Only the hash is
+// stored server-side, so a Redis snapshot/dump never exposes usable bearer
+// tokens.
+func hashRefreshToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
 
 // Service handles authentication business logic.
 type Service struct {
@@ -117,18 +136,32 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*AuthResponse, e
 
 // RefreshTokens exchanges a valid refresh token for a new token pair.
 func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*AuthResponse, error) {
-	sub, err := s.verifier.Verify(refreshToken)
+	claims, err := s.verifier.Verify(refreshToken)
 	if err != nil {
 		return nil, apierr.Unauthorized("invalid or expired refresh token")
 	}
 
-	key := refreshTokenPrefix + sub
-	stored, err := s.redis.Get(ctx, key).Result()
-	if err != nil || stored != refreshToken {
+	// Reject access tokens (or anything that isn't a refresh token) presented here.
+	if claims.TokenUse != platformauth.UseRefresh {
+		return nil, apierr.Unauthorized("invalid or expired refresh token")
+	}
+
+	key := refreshKey(claims.Subject, claims.JTI)
+
+	// Atomically fetch-and-delete the stored hash. GETDEL makes rotation
+	// race-free: of two concurrent refreshes for the same token, only one sees
+	// the value — the other gets redis.Nil and is rejected, so a single refresh
+	// token can never mint two live sessions.
+	stored, err := s.redis.GetDel(ctx, key).Result()
+	if err != nil {
+		return nil, apierr.Unauthorized("refresh token not recognised")
+	}
+	// Constant-time compare against the presented token's hash.
+	if subtle.ConstantTimeCompare([]byte(stored), []byte(hashRefreshToken(refreshToken))) != 1 {
 		return nil, apierr.Unauthorized("refresh token not recognised")
 	}
 
-	userUUID, err := uuid.Parse(sub)
+	userUUID, err := uuid.Parse(claims.Subject)
 	if err != nil {
 		return nil, apierr.Unauthorized("invalid token subject")
 	}
@@ -138,10 +171,46 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*Auth
 		return nil, apierr.Unauthorized("user not found")
 	}
 
-	// Rotate: invalidate old refresh token before issuing new pair.
-	s.redis.Del(ctx, key)
-
 	return s.issueTokenPair(ctx, u)
+}
+
+// Logout revokes the current session: it denylists the presented access token
+// (by jti, until it would have expired) and deletes the refresh session so it
+// can no longer be exchanged. The optional refresh token must belong to the
+// same subject as the access token — a user cannot revoke someone else's session.
+func (s *Service) Logout(ctx context.Context, accessClaims *platformauth.Claims, refreshToken string) error {
+	if accessClaims == nil {
+		return apierr.Unauthorized("missing authentication")
+	}
+
+	// Revoke the access token. This is a guarantee, not best-effort: if the
+	// denylist write fails, logout fails so the caller knows the token is still
+	// live.
+	if accessClaims.JTI != "" {
+		ttl := time.Until(accessClaims.ExpiresAt)
+		if ttl > 0 {
+			if err := s.redis.Set(ctx, platformauth.DenylistKey(accessClaims.JTI), "1", ttl).Err(); err != nil {
+				return apierr.Internal("failed to revoke access token")
+			}
+		}
+	}
+
+	if refreshToken != "" {
+		rc, err := s.verifier.Verify(refreshToken)
+		// Ignore a malformed/expired refresh token — access revocation already
+		// happened. But a *valid* token for another subject is an attempt to
+		// revoke a session that isn't the caller's: reject it.
+		if err == nil && rc.TokenUse == platformauth.UseRefresh {
+			if rc.Subject != accessClaims.Subject {
+				return apierr.Forbidden("refresh token does not belong to the authenticated user")
+			}
+			if err := s.redis.Del(ctx, refreshKey(rc.Subject, rc.JTI)).Err(); err != nil {
+				return apierr.Internal("failed to revoke refresh session")
+			}
+		}
+	}
+
+	return nil
 }
 
 // GoogleAuthURL returns the OAuth2 redirect URL with the given state.
@@ -224,8 +293,11 @@ func (s *Service) issueTokenPair(ctx context.Context, u *user.User) (*AuthRespon
 		return nil, apierr.Internal("failed to issue refresh token")
 	}
 
-	key := refreshTokenPrefix + uuidStr
-	if err := s.redis.Set(ctx, key, refresh, s.jwtCfg.RefreshTokenExpiry).Err(); err != nil {
+	// Store only the hash of the refresh token under a per-session key so
+	// concurrent sessions (multiple devices) coexist and can be revoked
+	// individually, and a Redis dump never leaks usable tokens.
+	key := refreshKey(uuidStr, refresh.JTI)
+	if err := s.redis.Set(ctx, key, hashRefreshToken(refresh.Token), s.jwtCfg.RefreshTokenExpiry).Err(); err != nil {
 		return nil, apierr.Internal("failed to store refresh token")
 	}
 
@@ -238,8 +310,8 @@ func (s *Service) issueTokenPair(ctx context.Context, u *user.User) (*AuthRespon
 			PlatformRole: string(u.PlatformRole),
 		},
 		Tokens: TokenPairResponse{
-			AccessToken:  access,
-			RefreshToken: refresh,
+			AccessToken:  access.Token,
+			RefreshToken: refresh.Token,
 		},
 	}, nil
 }
@@ -261,7 +333,7 @@ func fetchGoogleUserInfo(ctx context.Context, client *http.Client) (*googleUserI
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("google userinfo status: %d", resp.StatusCode)

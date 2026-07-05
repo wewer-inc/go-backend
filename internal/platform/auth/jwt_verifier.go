@@ -3,8 +3,9 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
@@ -14,79 +15,82 @@ var (
 	ErrMissingSubject = errors.New("missing subject claim")
 )
 
+// Claims is the validated, caller-facing view of a verified token.
+type Claims struct {
+	Subject   string
+	TokenUse  TokenUse
+	JTI       string
+	ExpiresAt time.Time
+}
+
 type Verifier interface {
-	Verify(token string) (string, error)
+	// Verify validates signature, issuer, audience and expiry, returning the claims.
+	Verify(token string) (*Claims, error)
 }
 
 type JWTVerifier struct {
-	secret []byte
-	issuer string
+	secret   []byte
+	issuer   string
+	audience string
 }
 
-func NewJWTVerifier(secret, issuer string) *JWTVerifier {
+func NewJWTVerifier(secret, issuer, audience string) *JWTVerifier {
 	return &JWTVerifier{
-		secret: []byte(secret),
-		issuer: issuer,
+		secret:   []byte(secret),
+		issuer:   issuer,
+		audience: audience,
 	}
 }
 
-// Verify validates a JWT token string and returns the subject claim.
-// It performs the following validations:
-// - Verifies the token signature using HMAC SHA256 signing method
-// - Checks token expiration and validity
-// - Validates the issuer claim if configured
-// - Extracts and validates the subject claim
+// Verify validates a JWT and returns its claims. It enforces the HMAC-SHA256
+// signing method (blocking alg-confusion / "none" attacks), a non-empty
+// subject, expiry, and — when configured — the issuer and audience claims.
 //
-// Parameters:
-//   - tokenString: The JWT token string to verify
-//
-// Returns:
-//   - string: The subject (sub) claim from the token if validation succeeds
-//   - error: Specific error types for different validation failures:
-//   - ErrExpiredToken: Token has expired
-//   - ErrInvalidToken: Token is malformed or invalid
-//   - ErrInvalidIssuer: Token issuer doesn't match expected issuer
-//   - ErrMissingSubject: Token missing or empty subject claim
-func (v *JWTVerifier) Verify(tokenString string) (string, error) {
-	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-		// Enforce signing method HMAC SHA256
+// Note: this does NOT check token_use. Each call site is responsible for
+// asserting claims.TokenUse so a refresh token cannot be replayed as an
+// access token (and vice versa).
+func (v *JWTVerifier) Verify(tokenString string) (*Claims, error) {
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithExpirationRequired(),
+	}
+	if v.issuer != "" {
+		opts = append(opts, jwt.WithIssuer(v.issuer))
+	}
+	if v.audience != "" {
+		opts = append(opts, jwt.WithAudience(v.audience))
+	}
+
+	claims := &tokenClaims{}
+	_, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return v.secret, nil
-	})
+	}, opts...)
 
 	if err != nil {
-		// jwt library already differentiates expired tokens
-		if errors.Is(err, jwt.ErrTokenExpired) {
-			return "", ErrExpiredToken
-		}
-		return "", ErrInvalidToken
-	}
-
-	if !token.Valid {
-		return "", ErrInvalidToken
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-
-	if !ok {
-		return "", ErrInvalidToken
-	}
-
-	// Validate issuer
-	if v.issuer != "" {
-		iss, ok := claims["iss"].(string)
-		if !ok || iss != v.issuer {
-			return "", ErrInvalidIssuer
+		switch {
+		case errors.Is(err, jwt.ErrTokenExpired):
+			return nil, ErrExpiredToken
+		case errors.Is(err, jwt.ErrTokenInvalidIssuer):
+			return nil, ErrInvalidIssuer
+		default:
+			return nil, ErrInvalidToken
 		}
 	}
 
-	// Extract subject
-	sub, ok := claims["sub"].(string)
-	if !ok || sub == "" {
-		return "", ErrMissingSubject
+	if claims.Subject == "" {
+		return nil, ErrMissingSubject
 	}
 
-	return sub, nil
+	out := &Claims{
+		Subject:  claims.Subject,
+		TokenUse: claims.TokenUse,
+		JTI:      claims.ID,
+	}
+	if claims.ExpiresAt != nil {
+		out.ExpiresAt = claims.ExpiresAt.Time
+	}
+	return out, nil
 }

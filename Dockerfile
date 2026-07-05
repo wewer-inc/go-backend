@@ -1,5 +1,5 @@
 # ---- Build stage ----
-FROM golang:1.26.3 AS builder
+FROM golang:1.26.4 AS builder
 WORKDIR /src
 
 # Reproducible, static builds
@@ -19,7 +19,7 @@ ENV GIT_TAG=${VERSION} \
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source (you can keep .git ignored via .dockerignore)
+# Copy source (.git, .env and local cruft are excluded via .dockerignore)
 COPY . .
 
 # Build binary directly — avoids pulling in lint/fmt/tidy deps not present in CI image
@@ -31,8 +31,26 @@ RUN mkdir -p .build && \
 
 # ---- Runtime stage ----
 FROM gcr.io/distroless/static:nonroot
+
+# Re-declare build args in this stage so the labels below can reference them.
+ARG VERSION=dev
+ARG COMMIT=none
+ARG DATE=unknown
+
+# OCI image metadata (https://github.com/opencontainers/image-spec)
+LABEL org.opencontainers.image.title="YOUR_APP_NAME" \
+      org.opencontainers.image.source="https://github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${DATE}"
+
 WORKDIR /app
 COPY --from=builder /src/.build/YOUR_APP_NAME /app/YOUR_APP_NAME
 EXPOSE 8080
 USER nonroot:nonroot
+
+# Self-probe via the binary's -healthcheck flag (image has no shell/wget/curl).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/app/YOUR_APP_NAME", "-healthcheck"]
+
 ENTRYPOINT ["/app/YOUR_APP_NAME"]

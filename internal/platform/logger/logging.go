@@ -25,7 +25,7 @@ func NewLogger(cfg pc.Config) zerolog.Logger {
 		return l
 	}
 
-	console := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:11:11"}
+	console := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05"}
 	l := zerolog.New(console).Level(level).With().Timestamp().Str("env", cfg.Env).Logger()
 	return l
 }

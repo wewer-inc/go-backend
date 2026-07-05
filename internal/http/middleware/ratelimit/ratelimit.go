@@ -4,7 +4,6 @@ import (
 	"net"
 	"strings"
 
-	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
 	"github.com/gin-gonic/gin"
 )
 
@@ -17,12 +16,10 @@ const (
 )
 
 // Resolver is responsible for selecting bucket + building the redis key identity
-type Resolver struct {
-	cfg config.RateLimitConfig
-}
+type Resolver struct{}
 
-func NewResolver(cfg config.RateLimitConfig) *Resolver {
-	return &Resolver{cfg: cfg}
+func NewResolver() *Resolver {
+	return &Resolver{}
 }
 
 // KeyForRequest returns the bucket and final redis key for the current request.
@@ -47,26 +44,12 @@ func buildIPKey(bucket Bucket, ip string) string {
 	return "rl:" + string(bucket) + ":ip:" + ip
 }
 
-// extractClientIP uses trust-proxy setting to decide how to interpret forwarded headers.
-// For now, keep it simple and safe.
+// extractClientIP returns the client IP. It delegates to gin's ClientIP(),
+// which only honours X-Forwarded-For when the immediate peer is a configured
+// trusted proxy (see config.TrustedProxies / gin.SetTrustedProxies). This
+// avoids the classic spoof where a client sets its own XFF to mint a fresh
+// rate-limit bucket per request.
 func (r *Resolver) extractClientIP(c *gin.Context) string {
-	if !r.cfg.TrustProxy {
-		return normalizeIP(c.ClientIP())
-	}
-
-	// Trust Proxy headers:	try X-Forwarded-For first
-	xff := c.GetHeader("X-Forwaded-For")
-	if xff != "" {
-		// First IP in the list is the client IP
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			ip := normalizeIP(strings.TrimSpace(parts[0]))
-			if ip != "" {
-				return ip
-			}
-		}
-	}
-	// Fallback to c.ClientIP()
 	return normalizeIP(c.ClientIP())
 }
 

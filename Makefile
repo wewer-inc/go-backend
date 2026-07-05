@@ -44,6 +44,13 @@ GITLEAKS       ?= $(shell command -v gitleaks 2>/dev/null)
 GOSEC          ?= $(BIN_DIR)/gosec
 GOSEC_FLAGS    ?= -severity medium -confidence medium
 
+# Pinned tool versions — keep in sync with .github/workflows/ci.yml. Must
+# support the Go toolchain in go.mod (older releases fail to build on newer Go).
+GOLANGCI_VERSION ?= v2.12.2
+STATICCHECK_VERSION ?= 2026.1
+GOVULNCHECK_VERSION ?= v1.2.0
+GOSEC_VERSION ?= v2.27.1
+
 # Docker/Compose
 DOCKER         ?= docker
 COMPOSE        ?= docker compose
@@ -121,20 +128,20 @@ help:
 setup: ## Install basic dev deps (Local linting)
 	@mkdir -p $(BIN_DIR)
 	@if [ ! -x "$(BIN_DIR)/golangci-lint" ]; then \
-	echo "$(YELLOW)> installing golangci-lint$(RESET)"; \
-	GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest; \
+	echo "$(YELLOW)> installing golangci-lint $(GOLANGCI_VERSION)$(RESET)"; \
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_VERSION)/install.sh | sh -s -- -b $(CURDIR)/$(BIN_DIR) $(GOLANGCI_VERSION); \
 	fi
 	@if [ ! -x "$(BIN_DIR)/staticcheck" ]; then \
-		echo "$(YELLOW)> installing staticcheck$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install honnef.co/go/tools/cmd/staticcheck@latest; \
+		echo "$(YELLOW)> installing staticcheck $(STATICCHECK_VERSION)$(RESET)"; \
+		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION); \
 	fi
 	@if [ ! -x "$(BIN_DIR)/govulncheck" ]; then \
-		echo "$(YELLOW)> installing govulncheck$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install golang.org/x/vuln/cmd/govulncheck@latest; \
+		echo "$(YELLOW)> installing govulncheck $(GOVULNCHECK_VERSION)$(RESET)"; \
+		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 	fi
 	@if [ ! -x "$(GOSEC)" ]; then \
-		echo "$(YELLOW)> installing gosec$(RESET)"; \
-		GOBIN=$(CURDIR)/$(BIN_DIR) $(GO) install github.com/securego/gosec/v2/cmd/gosec@latest; \
+		echo "$(YELLOW)> installing gosec $(GOSEC_VERSION)$(RESET)"; \
+		curl -sSfL https://raw.githubusercontent.com/securego/gosec/$(GOSEC_VERSION)/install.sh | sh -s -- -b $(CURDIR)/$(BIN_DIR) $(GOSEC_VERSION); \
 	fi
 	@echo "$(GREEN)✓ setup complete$(RESET)"
 
@@ -212,15 +219,10 @@ run: ## Run the application
 # ====== Docker workflow ======
 # ====== Docker / Compose targets ======
 export COMPOSE_PROJECT_NAME ?= $(COMPOSE_PROJECT_NAME)  # ensure compose picks it up
-DB_PROFILE ?= false
 
 .PHONY: docker-up
-docker-up: ## Up via compose (db+cache opt-in: make docker-up DB_PROFILE=true)
-ifeq ($(DB_PROFILE),true)
-	$(COMPOSE) --profile db --profile cache up --build -d
-else
+docker-up: ## Up via compose (starts api + postgres + redis)
 	$(COMPOSE) up --build -d
-endif
 	$(COMPOSE) ps
 
 

@@ -1,0 +1,44 @@
+# golangci-lint policy (v2 schema). Keep the version in sync with
+# .github/workflows/ci.yml GOLANGCI_LINT_VERSION and the Makefile.
+version: "2"
+
+run:
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # suspicious constructs
+    - ineffassign   # ineffectual assignments
+    - staticcheck   # broad correctness/bug suite (subsumes gosimple + stylecheck in v2)
+    - unused        # unused code
+    - bodyclose     # unclosed HTTP response bodies
+    - noctx         # HTTP requests without context
+    - revive        # style / best-practice
+    - misspell      # common misspellings
+    - gosec         # security issues
+    - errorlint     # error-wrapping correctness
+    - rowserrcheck  # sql.Rows.Err not checked
+  exclusions:
+    rules:
+      # Tests may use less strict error handling.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+      # Don't require doc comments on every exported symbol in the boilerplate;
+      # keep revive's other (behavioural) checks. Document deliberately as the
+      # codebase grows.
+      - linters:
+          - revive
+        text: "should have comment|should have a package comment"
+      # Config fields intentionally mirror their env var names (DB_DSN, ...).
+      - linters:
+          - revive
+        path: internal/platform/config/
+        text: "var-naming: don't use ALL_CAPS"
+      # AuthResponse is a clear, intentional name for this template's payload.
+      - linters:
+          - revive
+        text: "stutters"

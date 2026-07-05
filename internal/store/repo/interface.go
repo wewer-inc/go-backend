@@ -34,3 +34,14 @@ type GormRepo[T any] struct {
 func NewGormRepo[T any](db *gorm.DB) Repo[T] {
 	return &GormRepo[T]{db: db}
 }
+
+// conn returns the *gorm.DB to use for an operation. If ctx carries a
+// transaction (opened via store.WithTx), that transaction is used so the call
+// participates in it; otherwise the root connection is used. This makes
+// multi-step operations atomic through the repository abstraction.
+func (r *GormRepo[T]) conn(ctx context.Context) *gorm.DB {
+	if tx, ok := store.TxFromContext(ctx); ok {
+		return tx.WithContext(ctx)
+	}
+	return r.db.WithContext(ctx)
+}

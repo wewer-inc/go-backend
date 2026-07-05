@@ -2,10 +2,25 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog"
 )
+
+// ErrQueueFull is returned by Enqueue when the queue has no capacity. Callers
+// can decide whether to drop, retry, or surface an error to the user.
+var ErrQueueFull = errors.New("worker: queue full")
+
+// ErrStopped is returned by Enqueue after the worker has begun shutting down.
+var ErrStopped = errors.New("worker: stopped")
+
+var jobsDropped = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "worker_jobs_dropped_total",
+	Help: "Number of jobs dropped because the worker queue was full.",
+})
 
 // Job is a unit of work executed asynchronously.
 type Job func(ctx context.Context) error
@@ -16,6 +31,9 @@ type Worker struct {
 	concurrency int
 	log         zerolog.Logger
 	wg          sync.WaitGroup
+
+	mu     sync.Mutex // guards closed and serialises sends against close
+	closed bool
 }
 
 // New creates a Worker with the given concurrency and queue capacity.
@@ -27,8 +45,9 @@ func New(concurrency, queueSize int, log zerolog.Logger) *Worker {
 	}
 }
 
-// Start launches the goroutine pool. The pool runs until ctx is cancelled and
-// all in-flight jobs finish. Call Stop() to signal shutdown.
+// Start launches the goroutine pool. Jobs receive the provided context, so
+// passing an app-scoped (cancelable) context lets in-flight jobs observe
+// shutdown. The pool runs until the queue is closed (see Stop) or ctx is done.
 func (w *Worker) Start(ctx context.Context) {
 	for i := 0; i < w.concurrency; i++ {
 		w.wg.Add(1)
@@ -51,18 +70,52 @@ func (w *Worker) Start(ctx context.Context) {
 	}
 }
 
-// Enqueue submits a job. It is non-blocking; if the queue is full the job is
-// dropped and an error is logged.
-func (w *Worker) Enqueue(job Job) {
+// Enqueue submits a job. It is non-blocking; if the queue is full it returns
+// ErrQueueFull, and once the worker is stopping it returns ErrStopped. The
+// mutex serialises the send with Stop's close so a job can never be sent on a
+// closed channel.
+func (w *Worker) Enqueue(job Job) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrStopped
+	}
+
 	select {
 	case w.queue <- job:
+		return nil
 	default:
+		jobsDropped.Inc()
 		w.log.Warn().Msg("worker: queue full, dropping job")
+		return ErrQueueFull
 	}
 }
 
-// Stop drains the queue and waits for in-flight jobs to finish.
-func (w *Worker) Stop() {
+// Stop stops accepting new jobs and waits for in-flight jobs to finish, bounded
+// by ctx. If ctx is cancelled (e.g. the shutdown deadline elapses) before the
+// pool drains, Stop returns ctx.Err() rather than blocking forever. Safe to
+// call more than once.
+func (w *Worker) Stop(ctx context.Context) error {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
+	w.closed = true
 	close(w.queue)
-	w.wg.Wait()
+	w.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

@@ -44,7 +44,15 @@ func (h *Handler) List(c *gin.Context) {
 		items[i] = toNoteResponse(&notes[i])
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": items, "page": page})
+	c.JSON(http.StatusOK, apicommon.PaginatedResponse[NoteResponse]{
+		Data: items,
+		Page: &apicommon.Pagination{
+			Page:     page.Page,
+			PageSize: page.PageSize,
+			Total:    page.Total,
+			HasNext:  page.HasNext,
+		},
+	})
 }
 
 func (h *Handler) Create(c *gin.Context) {
@@ -56,7 +64,7 @@ func (h *Handler) Create(c *gin.Context) {
 
 	var req CreateNoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: err.Error()})
+		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: "validation_error", Message: "invalid request body"})
 		return
 	}
 
@@ -93,7 +101,7 @@ func (h *Handler) Update(c *gin.Context) {
 
 	var req UpdateNoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: err.Error()})
+		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: "validation_error", Message: "invalid request body"})
 		return
 	}
 

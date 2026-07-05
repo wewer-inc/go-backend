@@ -27,16 +27,25 @@ services:
       DB_CONN_LIFETIME: ${DB_CONN_LIFETIME:-1h}
       DB_CONN_IDLE_TIME: ${DB_CONN_IDLE_TIME:-10m}
       DB_SLOW_THRESHOLD: ${DB_SLOW_THRESHOLD:-200ms}
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      S3_ENABLED: ${S3_ENABLED:-false}
     ports:
       - "8080:8080"
+    # Wait for the backing services the app needs before starting.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # The image is distroless (no shell/wget); probe via the binary's flag.
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "/app/YOUR_APP_NAME", "-healthcheck"]
       interval: 5s
       timeout: 2s
       retries: 15
     restart: unless-stopped
   redis:
-    profiles: ["cache"] # enable with: docker compose --profile cache up
     image: redis:7-alpine
     container_name: YOUR_APP_NAME-redis
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -50,7 +59,6 @@ services:
     restart: unless-stopped
 
   postgres:
-    profiles: ["db"] # enable with: docker compose --profile db up --build
     image: postgres:16-alpine
     container_name: YOUR_APP_NAME-postgres
     environment:

@@ -20,7 +20,7 @@ type Middleware struct {
 func NewMiddleware(cfg config.RateLimitConfig, limiter *Limiter) *Middleware {
 	return &Middleware{
 		cfg:      cfg,
-		resolver: NewResolver(cfg),
+		resolver: NewResolver(),
 		limiter:  limiter,
 	}
 }

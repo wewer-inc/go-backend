@@ -6,8 +6,8 @@ type SortField struct {
 	Desc  bool
 }
 
-// (Advanced WHERE condition)
-// Clause represents a single SQL clause with its expression and arguments
+// Clause represents a single advanced SQL WHERE condition with its expression
+// and arguments.
 type Clause struct {
 	Expr string
 	Args []any
