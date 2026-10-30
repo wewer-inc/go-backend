@@ -3,6 +3,7 @@ module github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME
 go 1.26.4
 
 require (
+	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/aws/aws-sdk-go-v2 v1.41.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.94.0
@@ -77,6 +78,7 @@ require (
 	github.com/quic-go/quic-go v0.57.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.0 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/arch v0.20.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
