@@ -302,3 +302,109 @@ func TestUserRepo_RollbackAndCommit(t *testing.T) {
 		t.Errorf("expected 1 user after commit, got %d", count)
 	}
 }
+
+func TestUpdateColumnsGuarded(t *testing.T) {
+	ctx := context.Background()
+	r := repo.NewGormRepo[TestUserEntity](newTestDB(t))
+	a := &TestUserEntity{Email: "a@example.com", Name: "a", PlatformRole: "pending"}
+	b := &TestUserEntity{Email: "b@example.com", Name: "", PlatformRole: "pending"}
+	for _, u := range []*TestUserEntity{a, b} {
+		if err := r.Create(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := map[string]any{"platform_role": "pending"}
+
+	ok, err := r.UpdateColumnsGuarded(ctx, a.ID, pending, nil, map[string]any{"platform_role": "active"})
+	if err != nil || !ok {
+		t.Fatalf("first transition: ok=%v err=%v", ok, err)
+	}
+	ok, err = r.UpdateColumnsGuarded(ctx, a.ID, pending, nil, map[string]any{"platform_role": "lost-the-race"})
+	if err != nil || ok {
+		t.Fatalf("second transition must lose: ok=%v err=%v", ok, err)
+	}
+	got, _ := r.GetByID(ctx, a.ID)
+	if got.PlatformRole != "active" {
+		t.Fatalf("role = %q", got.PlatformRole)
+	}
+
+	// A nil guard value is IS NULL, never raw SQL.
+	ok, err = r.UpdateColumnsGuarded(ctx, a.ID, map[string]any{"deleted_at": nil}, nil, map[string]any{"name": "still-live"})
+	if err != nil || !ok {
+		t.Fatalf("IS NULL guard: ok=%v err=%v", ok, err)
+	}
+
+	// A raw OR condition must stay scoped to this id: b also has an empty name.
+	where := []store.Clause{{Expr: "name IS NULL OR name = ?", Args: []any{""}}}
+	ok, err = r.UpdateColumnsGuarded(ctx, a.ID, nil, where, map[string]any{"platform_role": "x"})
+	if err != nil || ok {
+		t.Fatalf("raw guard should not match a: ok=%v err=%v", ok, err)
+	}
+	got, _ = r.GetByID(ctx, b.ID)
+	if got.PlatformRole != "pending" {
+		t.Fatal("a raw OR guard leaked to another row")
+	}
+
+	// Injected keys are refused whichever value they carry, nil included.
+	for _, val := range []any{"x", nil} {
+		_, err := r.UpdateColumnsGuarded(ctx, a.ID, map[string]any{"1=1) OR (1=1": val}, nil, map[string]any{"name": "pwned"})
+		if err == nil {
+			t.Fatalf("injected guard column with value %v was accepted", val)
+		}
+	}
+	got, _ = r.GetByID(ctx, b.ID)
+	if got.Name == "pwned" {
+		t.Fatal("injection reached another row")
+	}
+}
+
+func TestListTotalIsRightWithAndWithoutTheCountQuery(t *testing.T) {
+	ctx := context.Background()
+	r := repo.NewGormRepo[TestUserEntity](newTestDB(t))
+	for i := range 5 {
+		if err := r.Create(ctx, &TestUserEntity{Email: fmt.Sprintf("u%d@example.com", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		page, size int
+		rows       int
+		total      int64
+		next       bool
+	}{
+		{1, 10, 5, 5, false}, // room to spare: derived
+		{1, 5, 5, 5, false},  // exactly full: counted
+		{1, 2, 2, 5, true},   // full with more after it
+		{3, 2, 1, 5, false},  // short last page: derived
+		{9, 2, 0, 5, false},  // past the end: counted, not offset+0
+	}
+	for _, tc := range cases {
+		rows, info, err := r.List(ctx, store.QueryOpts{Page: tc.page, PageSize: tc.size})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != tc.rows || info.Total != tc.total || info.HasNext != tc.next {
+			t.Errorf("page %d size %d: rows=%d total=%d next=%v", tc.page, tc.size, len(rows), info.Total, info.HasNext)
+		}
+	}
+}
+
+func TestUnscopedFindsSoftDeletedRows(t *testing.T) {
+	ctx := context.Background()
+	r := repo.NewGormRepo[TestUserEntity](newTestDB(t))
+	u := &TestUserEntity{Email: "gone@example.com"}
+	if err := r.Create(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SoftDelete(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	opts := store.QueryOpts{Filters: map[string]any{"email": u.Email}}
+	if n, _ := r.Count(ctx, opts); n != 0 {
+		t.Fatalf("default scope count = %d", n)
+	}
+	opts.Unscoped = true
+	if n, _ := r.Count(ctx, opts); n != 1 {
+		t.Fatalf("unscoped count = %d", n)
+	}
+}

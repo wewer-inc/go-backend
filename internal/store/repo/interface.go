@@ -20,6 +20,7 @@ type Repo[T any] interface {
 	Count(ctx context.Context, opts store.QueryOpts) (int64, error)
 	Update(ctx context.Context, entity *T) error
 	UpdateColumnsByID(ctx context.Context, id uint, cols map[string]any) error
+	UpdateColumnsGuarded(ctx context.Context, id uint, guard map[string]any, where []store.Clause, cols map[string]any) (bool, error)
 	SoftDelete(ctx context.Context, id uint) error
 	HardDelete(ctx context.Context, id uint) error
 	Upsert(ctx context.Context, entity *T, conflictKeys []string) error

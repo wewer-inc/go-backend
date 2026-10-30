@@ -39,6 +39,10 @@ func normalizePagination(opts store.QueryOpts) (page, pageSize int) {
 
 // apply where, filters, sorting, selects, and preloads from QueryOpts to the gorm DB instance.
 func applyQueryOptsBase(db *gorm.DB, opts store.QueryOpts) *gorm.DB {
+	if opts.Unscoped {
+		db = db.Unscoped()
+	}
+
 	// simple filters: column = value. Column names are identifiers and are
 	// validated; values are always parameterized.
 	for col, val := range opts.Filters {

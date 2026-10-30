@@ -2,9 +2,11 @@ package repo
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -81,27 +83,30 @@ func (r *GormRepo[T]) List(ctx context.Context, opts store.QueryOpts) ([]T, stor
 	// base model for this entity type
 	var (
 		entities []T
-		total    int64
 		zeroT    T
 	)
 
-	// 1) count query (no pagination)
-	countDB := r.conn(ctx).Model(&zeroT)
-	countDB = applyQueryOptsBase(countDB, opts)
-
-	if err := countDB.Count(&total).Error; err != nil {
-		return nil, store.PageInfo{}, err
-	}
-
-	// 2) data query (with pagination)
+	// 1) the requested page
 	dataDB := r.conn(ctx).Model(&zeroT)
 	dataDB = applyQueryOptsBase(dataDB, opts)
 
 	offset := (page - 1) * pageSize
-	dataDB = dataDB.Limit(pageSize).Offset(offset)
-
-	if err := dataDB.Find(&entities).Error; err != nil {
+	if err := dataDB.Offset(offset).Limit(pageSize).Find(&entities).Error; err != nil {
 		return nil, store.PageInfo{}, err
+	}
+
+	// 2) the total. A short page must be the last one, so offset plus its length is already
+	// the answer and the extra query is avoided. Run the count only when that sum can't be
+	// trusted: rows may follow a full page, and an empty page beyond the first may lie past
+	// the end of the results.
+	total := int64(offset + len(entities))
+	if len(entities) == pageSize || (len(entities) == 0 && offset > 0) {
+		countDB := r.conn(ctx).Model(&zeroT)
+		countDB = applyQueryOptsBase(countDB, opts)
+
+		if err := countDB.Count(&total).Error; err != nil {
+			return nil, store.PageInfo{}, err
+		}
 	}
 
 	// 3) page info
@@ -150,6 +155,40 @@ func (r *GormRepo[T]) UpdateColumnsByID(ctx context.Context, id uint, cols map[s
 		Model(&zeroT).
 		Where("id = ?", id).
 		UpdateColumns(cols).Error
+}
+
+// UpdateColumnsGuarded is a compare-and-set for state transitions that concurrent requests
+// can race on. It writes cols to row id only if the guard conditions still hold and returns
+// whether a row changed, so the request that lost gets false instead of replacing what the
+// winner wrote.
+//
+// Each guard key is a column name, checked before use, and a nil guard value means IS NULL.
+// Anything equality cannot say goes in where. Those Exprs are raw SQL and, like
+// QueryOpts.Where, must never contain request input. They are parenthesised one by one,
+// since an OR inside one would otherwise escape the surrounding AND and reach rows other
+// than id.
+func (r *GormRepo[T]) UpdateColumnsGuarded(ctx context.Context, id uint, guard map[string]any, where []store.Clause, cols map[string]any) (bool, error) {
+	var zeroT T
+	db := r.conn(ctx)
+	q := db.Model(&zeroT).Where("id = ?", id)
+	for col, val := range guard {
+		if !validIdentifier(col) {
+			return false, fmt.Errorf("invalid guard column %q", col)
+		}
+		if val == nil {
+			q = q.Where(col + " IS NULL")
+			continue
+		}
+		q = q.Where(col+" = ?", val)
+	}
+	for _, c := range where {
+		q = q.Where(db.Session(&gorm.Session{NewDB: true}).Where(c.Expr, c.Args...))
+	}
+	result := q.UpdateColumns(cols)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // SoftDelete marks an entity of type T as deleted by its primary key ID.
