@@ -26,7 +26,7 @@ func NewHandler(svc *Service, secureCookies bool) *Handler {
 func (h *Handler) Register(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, apierr.BadRequest("validation_error", "invalid request body"))
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -42,7 +42,7 @@ func (h *Handler) Register(c *gin.Context) {
 func (h *Handler) Login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, apierr.BadRequest("validation_error", "invalid request body"))
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -58,7 +58,7 @@ func (h *Handler) Login(c *gin.Context) {
 func (h *Handler) Refresh(c *gin.Context) {
 	var req RefreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, apierr.BadRequest("validation_error", "invalid request body"))
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -145,9 +145,12 @@ func randomState() (string, error) {
 
 // respondError maps *apierr.APIError to its HTTP status, falls back to 500.
 func respondError(c *gin.Context, err error) {
+	// Attaching the error lets the request logger record the cause under its request_id.
+	// Only the code, message and details go into the response.
+	_ = c.Error(err)
 	var apiErr *apierr.APIError
 	if errors.As(err, &apiErr) {
-		c.JSON(apiErr.Status, apicommon.Response[any]{Error: apiErr.Code, Message: apiErr.Message})
+		c.JSON(apiErr.Status, apicommon.Response[any]{Error: apiErr.Code, Message: apiErr.Message, Details: apiErr.Details})
 		return
 	}
 	c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})

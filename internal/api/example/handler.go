@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/note"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
@@ -35,7 +36,7 @@ func (h *Handler) List(c *gin.Context) {
 		PageSize: 20,
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -64,7 +65,7 @@ func (h *Handler) Create(c *gin.Context) {
 
 	var req CreateNoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: "validation_error", Message: "invalid request body"})
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -76,7 +77,7 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 
 	if err := h.repo.Create(c.Request.Context(), n); err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -101,7 +102,7 @@ func (h *Handler) Update(c *gin.Context) {
 
 	var req UpdateNoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: "validation_error", Message: "invalid request body"})
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -113,7 +114,7 @@ func (h *Handler) Update(c *gin.Context) {
 	}
 
 	if err := h.repo.Update(c.Request.Context(), n); err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -128,7 +129,7 @@ func (h *Handler) Delete(c *gin.Context) {
 	}
 
 	if err := h.repo.SoftDelete(c.Request.Context(), n.ID); err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -154,7 +155,7 @@ func (h *Handler) fetchOwnedNote(c *gin.Context) (*note.Note, bool) {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, apicommon.Response[any]{Error: "note_not_found"})
 		} else {
-			c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+			respondInternal(c, err)
 		}
 		return nil, false
 	}
@@ -165,4 +166,12 @@ func (h *Handler) fetchOwnedNote(c *gin.Context) (*note.Note, bool) {
 	}
 
 	return n, true
+}
+
+// respondInternal answers 500 with a generic body and hands the cause to the
+// request logger, so a failed request stays diagnosable by its request_id.
+func respondInternal(c *gin.Context, cause error) {
+	e := apierr.InternalErr(cause, "something went wrong")
+	_ = c.Error(e)
+	c.JSON(e.Status, apicommon.Response[any]{Error: e.Code, Message: e.Message})
 }

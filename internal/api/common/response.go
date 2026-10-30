@@ -1,9 +1,12 @@
 package apicommon
 
 // Response is the standard single-item / message envelope returned by all handlers.
+// On failure "error" holds the machine code and "message" the text, and "details" is
+// added only for an error that has some for the client to use (apierr.APIError.Details).
 type Response[T any] struct {
 	Error   string `json:"error,omitempty"`
 	Message string `json:"message,omitempty"`
+	Details any    `json:"details,omitempty"`
 	Data    *T     `json:"data,omitempty"`
 }
 
