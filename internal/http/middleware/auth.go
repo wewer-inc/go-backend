@@ -8,6 +8,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -88,6 +89,9 @@ func UserAuth(
 		c.Set(ctxActorUserUUID, u.UUID.String())
 		c.Set(ctxActorPlatformRole, u.PlatformRole)
 		c.Set(ctxActorClaims, claims)
+		// The role comes from the row just loaded, not the token, so a demotion takes
+		// effect on the next request rather than when the token expires.
+		c.Set(ctxActorSubject, authz.Subject{UserID: u.ID, Role: u.PlatformRole})
 
 		c.Next()
 	}

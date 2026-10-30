@@ -9,6 +9,7 @@ import (
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 	"github.com/gin-gonic/gin"
 )
 
@@ -154,4 +155,21 @@ func respondError(c *gin.Context, err error) {
 		return
 	}
 	c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+}
+
+// Permissions serves the actor's action set so a client can show only what will work.
+// It is a convenience for the interface: the server still enforces every decision.
+func (h *Handler) Permissions(c *gin.Context) {
+	s, ok := middleware.GetActorSubject(c)
+	if !ok {
+		respondError(c, apierr.Unauthorized("unauthorized"))
+		return
+	}
+	resp := PermissionsResponse{
+		Role:         s.Role,
+		Permissions:  authz.PermissionsFor(s.Role),
+		Capabilities: authz.CapabilitiesFor(s.Role),
+		Scopes:       authz.ScopesFor(s.Role),
+	}
+	c.JSON(http.StatusOK, apicommon.Response[PermissionsResponse]{Data: &resp})
 }

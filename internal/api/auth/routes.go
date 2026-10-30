@@ -43,5 +43,6 @@ func RegisterRoutes(
 	sec := secured.Group("/auth")
 	{
 		sec.POST("/logout", h.Logout)
+		sec.GET("/permissions", h.Permissions)
 	}
 }
