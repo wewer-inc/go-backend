@@ -12,6 +12,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
 	pdb "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/db"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/heartbeat"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/logger"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/objectstore"
 	redisstore "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/redis"
@@ -31,6 +32,7 @@ type App struct {
 	Mailer       email.Mailer
 	Worker       *worker.Worker
 	workerCancel context.CancelFunc
+	heartbeat    *heartbeat.Beater
 }
 
 // Build wires all dependencies and returns a ready-to-start App.
@@ -46,6 +48,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		ConnMaxLifetime: cfg.DB_CONN_LIFETIME,
 		ConnMaxIdleTime: cfg.DB_CONN_IDLE_TIME,
 		SlowThreshold:   cfg.DB_SLOW_THRESHOLD,
+		LogQueryValues:  cfg.DB_LOG_QUERY_VALUES,
 	}, log)
 	if err != nil {
 		return nil, err
@@ -164,6 +167,9 @@ func (a *App) Start() error {
 	a.workerCancel = cancel
 	a.Worker.Start(workerCtx)
 
+	a.heartbeat = heartbeat.New(a.log, heartbeat.Interval).WithFields(pdb.PoolStatsFields(a.db))
+	a.heartbeat.Start()
+
 	go func() {
 		if err := a.srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) && err != nil {
 			a.log.Error().Err(err).Msg("http: server error")
@@ -173,6 +179,10 @@ func (a *App) Start() error {
 }
 
 func (a *App) Stop(ctx context.Context) error {
+	if a.heartbeat != nil {
+		a.heartbeat.Stop()
+	}
+
 	if a == nil {
 		return nil
 	}

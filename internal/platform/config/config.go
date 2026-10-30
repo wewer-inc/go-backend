@@ -120,6 +120,7 @@ type Config struct {
 	DB_CONN_LIFETIME    time.Duration
 	DB_CONN_IDLE_TIME   time.Duration
 	DB_SLOW_THRESHOLD   time.Duration
+	DB_LOG_QUERY_VALUES bool
 
 	// --- S3 Settings ---
 	S3 S3Config
@@ -181,6 +182,7 @@ func Load() Config {
 	cfg.DB_CONN_LIFETIME = parseDuration("DB_CONN_LIFETIME", 30*time.Minute)
 	cfg.DB_CONN_IDLE_TIME = parseDuration("DB_CONN_IDLE_TIME", 9*time.Minute)
 	cfg.DB_SLOW_THRESHOLD = parseDuration("DB_SLOW_THRESHOLD", 200*time.Millisecond)
+	cfg.DB_LOG_QUERY_VALUES = parseBool("DB_LOG_QUERY_VALUES", false)
 
 	// HTTP hardening (defaults: 1 MiB body, 1 MiB headers)
 	cfg.MaxRequestBodyBytes = int64(parseInt("HTTP_MAX_BODY_BYTES", 1<<20))
