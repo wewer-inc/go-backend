@@ -43,6 +43,7 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 		middleware.Logger(deps.Log),
 		middleware.SecurityHeaders(),
 		middleware.BodyLimit(deps.Cfg.MaxRequestBodyBytes),
+		middleware.RejectNULBytes(),
 		metrics.Middleware(),
 	)
 
