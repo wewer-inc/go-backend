@@ -1,35 +1,37 @@
 package auth
 
 import (
-	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
-	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/gin-gonic/gin"
 	goredis "github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
+	"gorm.io/gorm"
 )
+
+// Deps is what the auth module needs.
+type Deps struct {
+	Cfg    config.Config
+	DB     *gorm.DB
+	Issuer platformauth.Issuer
+	Redis  *goredis.Client // optional
+	Audit  *auditlog.Recorder
+	Log    zerolog.Logger
+	// AuthLimit, if non-nil, is the strict rate limit on the public endpoints.
+	AuthLimit gin.HandlerFunc
+}
 
 // RegisterRoutes wires auth endpoints.
 //   - v1 is the unprotected /v1 group (login/register/refresh need no JWT).
-//   - secured is the authenticated group (UserAuth applied) used for logout.
-//   - authLimit, if non-nil, is a stricter rate-limit middleware applied only to
-//     the brute-force-sensitive public auth endpoints.
-func RegisterRoutes(
-	v1 *gin.RouterGroup,
-	secured *gin.RouterGroup,
-	cfg config.Config,
-	userRepo repo.Repo[user.User],
-	issuer platformauth.Issuer,
-	verifier platformauth.Verifier,
-	redis *goredis.Client,
-	authLimit gin.HandlerFunc,
-) {
-	svc := NewService(userRepo, issuer, verifier, redis, cfg)
-	h := NewHandler(svc, cfg.Env == "prod")
+//   - secured is the authenticated group (UserAuth applied).
+func RegisterRoutes(v1, secured *gin.RouterGroup, d Deps) {
+	svc := NewService(d)
+	h := NewHandler(svc, d.Cfg.Env == "prod")
 
 	pub := v1.Group("/auth")
-	if authLimit != nil {
-		pub.Use(authLimit)
+	if d.AuthLimit != nil {
+		pub.Use(d.AuthLimit)
 	}
 	{
 		pub.POST("/register", h.Register)
@@ -44,5 +46,8 @@ func RegisterRoutes(
 	{
 		sec.POST("/logout", h.Logout)
 		sec.GET("/permissions", h.Permissions)
+		sec.GET("/sessions", h.ListSessions)
+		sec.DELETE("/sessions", h.RevokeOtherSessions)
+		sec.DELETE("/sessions/:sid", h.RevokeSession)
 	}
 }

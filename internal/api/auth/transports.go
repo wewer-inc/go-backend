@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"time"
+
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 )
 
@@ -52,4 +55,33 @@ type PermissionsResponse struct {
 	Permissions  []authz.Permission        `json:"permissions"`
 	Capabilities []authz.Capability        `json:"capabilities"`
 	Scopes       map[authz.Resource]string `json:"scopes"`
+}
+
+// SessionView is a session as shown to the user who owns it. Hashes never leave the
+// server.
+type SessionView struct {
+	UUID         string    `json:"uuid"`
+	Current      bool      `json:"current"`
+	LoginMethod  string    `json:"login_method"`
+	UserAgent    string    `json:"user_agent"`
+	IP           string    `json:"ip"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastUsedAt   time.Time `json:"last_used_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	Impersonated bool      `json:"impersonated"`
+}
+
+func toSessionView(row *session.Session, currentSID string) SessionView {
+	id := row.UUID.String()
+	return SessionView{
+		UUID:         id,
+		Current:      id == currentSID,
+		LoginMethod:  string(row.LoginMethod),
+		UserAgent:    row.UserAgent,
+		IP:           row.IP,
+		CreatedAt:    row.CreatedAt,
+		LastUsedAt:   row.LastUsedAt,
+		ExpiresAt:    row.AbsoluteExpiry,
+		Impersonated: row.ImpersonatorUserID != nil,
+	}
 }

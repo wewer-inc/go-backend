@@ -75,7 +75,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		log.Info().Msg("s3: disabled (S3_ENABLED=false)")
 	}
 
-	// Redis is optional, but auth, rate limiting and token revocation require it.
+	// Redis is optional. Rate limiting and the access-token denylist need it; auth does not.
 	var redisClient *redisstore.Client
 	if cfg.RedisEnabled {
 		rc, err := redisstore.NewClient(cfg.Redis)
@@ -91,7 +91,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		}
 		redisClient = rc
 	} else {
-		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — auth, rate limiting and token revocation are unavailable")
+		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — rate limiting is unavailable; auth endpoints run unthrottled")
 	}
 
 	// Email: real SMTP when a host is configured, noop otherwise. Production

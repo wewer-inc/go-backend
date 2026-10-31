@@ -57,9 +57,9 @@ curl http://localhost:8080/version  # build info
 | Area                | What                                                        |
 | ------------------- | ----------------------------------------------------------- |
 | **Framework**       | Gin (HTTP), GORM (ORM), gormigrate (versioned migrations)   |
-| **Auth**            | JWT access + refresh tokens, Google OAuth, bcrypt passwords |
+| **Auth**            | JWT access tokens, server-side sessions with rotating refresh tokens, Google OAuth, bcrypt passwords |
 | **Database**        | PostgreSQL with connection pooling, soft deletes            |
-| **Cache**           | Redis — refresh token storage, GCRA rate limiting           |
+| **Cache**           | Redis (optional) — GCRA rate limiting, access token denylist |
 | **Object storage**  | S3-compatible interface (AWS, MinIO, Cloudflare R2)         |
 | **Email**           | SMTP interface — NoopMailer in dev, SMTPMailer in prod      |
 | **Background jobs** | In-process goroutine worker pool with graceful drain        |
@@ -133,13 +133,22 @@ For flows that coordinate multiple repos, send email, or enqueue a job — add a
 
 ## Auth endpoints
 
-| Method | Path                       | Auth |
-| ------ | -------------------------- | ---- |
-| POST   | `/v1/auth/register`        | —    |
-| POST   | `/v1/auth/login`           | —    |
-| POST   | `/v1/auth/refresh`         | —    |
-| GET    | `/v1/auth/google`          | —    |
-| GET    | `/v1/auth/google/callback` | —    |
+| Method | Path                       | Auth   |
+| ------ | -------------------------- | ------ |
+| POST   | `/v1/auth/register`        | —      |
+| POST   | `/v1/auth/login`           | —      |
+| POST   | `/v1/auth/refresh`         | —      |
+| GET    | `/v1/auth/google`          | —      |
+| GET    | `/v1/auth/google/callback` | —      |
+| POST   | `/v1/auth/logout`          | Bearer |
+| GET    | `/v1/auth/permissions`     | Bearer |
+| GET    | `/v1/auth/sessions`        | Bearer |
+| DELETE | `/v1/auth/sessions`        | Bearer |
+| DELETE | `/v1/auth/sessions/:sid`   | Bearer |
+
+`DELETE /v1/auth/sessions` signs out every session but the current one.
+
+Refresh tokens rotate on every use. If several requests refresh with the same token at once, one succeeds and the others get `409 refresh_retry`: keep the session, and retry with the newest token. Presenting a rotated token after `REFRESH_RACE_WINDOW` is treated as theft and revokes the session.
 
 All auth responses return:
 

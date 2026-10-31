@@ -141,27 +141,31 @@ An in-process goroutine pool. Use it for fire-and-forget side effects that shoul
 POST /v1/auth/login
     │
     ├─ verify password (bcrypt)
-    ├─ issue access token  (JWT, 15m, signed with JWT_SECRET)
-    ├─ issue refresh token (JWT, 7d)
-    ├─ store refresh token in Redis: key = refresh_token:{user_uuid}
+    ├─ create a row in sessions, holding only the SHA-256 of an opaque refresh token
+    ├─ issue access token (JWT, 15m, signed with JWT_SECRET, carrying the session's id as sid)
     └─ return { access_token, refresh_token }
 
 POST /v1/auth/refresh
-    ├─ verify refresh JWT signature and expiry
-    ├─ check Redis key still exists (allows server-side revocation)
-    ├─ issue new access token
-    └─ return { access_token }
+    ├─ find the session by the token's hash
+    ├─ rotate with a compare-and-set on that hash, remembering the previous one
+    └─ return { access_token, refresh_token }
+
+    The previous token presented again:
+    ├─ within REFRESH_RACE_WINDOW: a concurrent request lost. 409 refresh_retry, session kept
+    └─ later: a replay. The session is revoked
 
 Authenticated request:
     Authorization: Bearer <access_token>
     │
     └─ UserAuth middleware:
         ├─ parse and verify JWT
+        ├─ check the jti denylist, if Redis is enabled
         ├─ load user from DB (ensures account not deleted mid-session)
+        ├─ load the session from DB (a revoked session stops working on the next request)
         └─ store actor_user_id, actor_user_uuid, actor_platform_role in Gin context
 ```
 
-Storing the refresh token in Redis (not just as a signed JWT) means you can revoke any session immediately by deleting the Redis key — no need to wait for token expiry.
+Sessions live in Postgres, so revoking one takes effect on the next request and auth works with Redis disabled. Redis adds rate limiting and the access-token denylist.
 
 ---
 

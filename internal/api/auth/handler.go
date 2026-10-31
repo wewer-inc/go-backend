@@ -24,6 +24,14 @@ func NewHandler(svc *Service, secureCookies bool) *Handler {
 	return &Handler{svc: svc, secure: secureCookies}
 }
 
+func loginContext(c *gin.Context) LoginContext {
+	ua := c.Request.UserAgent()
+	if len(ua) > maxUserAgentLen {
+		ua = ua[:maxUserAgentLen]
+	}
+	return LoginContext{UserAgent: ua, IP: c.ClientIP()}
+}
+
 func (h *Handler) Register(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -31,7 +39,7 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.Register(c.Request.Context(), req)
+	resp, err := h.svc.Register(c.Request.Context(), req, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
@@ -47,7 +55,7 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.Login(c.Request.Context(), req)
+	resp, err := h.svc.Login(c.Request.Context(), req, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
@@ -63,7 +71,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.RefreshTokens(c.Request.Context(), req.RefreshToken)
+	resp, err := h.svc.RefreshTokens(c.Request.Context(), req.RefreshToken, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
@@ -72,21 +80,54 @@ func (h *Handler) Refresh(c *gin.Context) {
 	c.JSON(http.StatusOK, apicommon.Response[AuthResponse]{Data: resp})
 }
 
-// Logout revokes the caller's access token and (optionally) a supplied refresh
-// session. It is mounted on the authenticated routes, so the access claims are
-// already present in context.
+// Logout revokes the caller's session and (optionally) a supplied refresh session. It is
+// mounted on the authenticated routes, so the access claims are already in context.
 func (h *Handler) Logout(c *gin.Context) {
 	var req LogoutRequest
-	// Body is optional; ignore bind errors and fall back to access-token-only revocation.
+	// Body is optional; ignore bind errors and fall back to the current session only.
 	_ = c.ShouldBindJSON(&req)
 
 	claims, _ := middleware.GetActorClaims(c)
-	if err := h.svc.Logout(c.Request.Context(), claims, req.RefreshToken); err != nil {
+	userID, _ := middleware.GetActorUserID(c)
+	if err := h.svc.Logout(c.Request.Context(), userID, claims, req.RefreshToken, c.ClientIP()); err != nil {
 		respondError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "logged out"})
+}
+
+// ListSessions serves the caller's live sessions.
+func (h *Handler) ListSessions(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	views, err := h.svc.ListSessions(c.Request.Context(), userID, claims.SID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[[]SessionView]{Data: &views})
+}
+
+// RevokeSession ends the session named by the sid path parameter.
+func (h *Handler) RevokeSession(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	if err := h.svc.RevokeSession(c.Request.Context(), userID, c.Param("sid"), c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "session revoked"})
+}
+
+// RevokeOtherSessions signs the caller out everywhere but this session.
+func (h *Handler) RevokeOtherSessions(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	if err := h.svc.RevokeOtherSessions(c.Request.Context(), userID, claims.SID, c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "other sessions revoked"})
 }
 
 func (h *Handler) GoogleRedirect(c *gin.Context) {
@@ -126,7 +167,7 @@ func (h *Handler) GoogleCallback(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.GoogleCallback(c.Request.Context(), code)
+	resp, err := h.svc.GoogleCallback(c.Request.Context(), code, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return

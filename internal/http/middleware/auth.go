@@ -1,18 +1,23 @@
 package middleware
 
 import (
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
 )
 
 const (
@@ -22,17 +27,18 @@ const (
 	ctxActorClaims       = "actor_claims"
 )
 
-// UserAuth validates a JWT access token and loads the user into context.
-// redis may be nil (revocation checks are then skipped). revocationFailOpen
-// decides behaviour when the revocation store cannot be queried: true accepts
-// the token, false rejects with 503.
+// UserAuth validates a JWT access token, checks its session is still live, and loads the
+// user into context. redis may be nil, which skips only the jti denylist: the session
+// check does not need it. revocationFailOpen decides behaviour when the denylist cannot
+// be queried: true accepts the token, false rejects with 503.
 func UserAuth(
 	verifier auth.Verifier,
 	userRepo repo.Repo[user.User],
+	sessionRepo repo.Repo[session.Session],
 	redis *goredis.Client,
 	revocationFailOpen bool,
 ) gin.HandlerFunc {
-	authenticate := authenticator(verifier, userRepo, redis, revocationFailOpen)
+	authenticate := authenticator(verifier, userRepo, sessionRepo, redis, revocationFailOpen)
 	return func(c *gin.Context) {
 		if authenticate(c) {
 			c.Next()
@@ -46,6 +52,7 @@ func UserAuth(
 func authenticator(
 	verifier auth.Verifier,
 	userRepo repo.Repo[user.User],
+	sessionRepo repo.Repo[session.Session],
 	redis *goredis.Client,
 	revocationFailOpen bool,
 ) func(c *gin.Context) bool {
@@ -102,6 +109,10 @@ func authenticator(
 			return false
 		}
 
+		if !sessionAlive(c, sessionRepo, claims, u.ID) {
+			return false
+		}
+
 		c.Set(ctxActorUserID, u.ID)
 		c.Set(ctxActorUserUUID, u.UUID.String())
 		c.Set(ctxActorPlatformRole, u.PlatformRole)
@@ -114,15 +125,43 @@ func authenticator(
 	}
 }
 
+// sessionAlive checks the token's session against the database, which is what makes
+// revocation take effect on the next request rather than when the token expires. A token
+// with no session cannot be revoked, so it is refused. A failed read is a 503, not a 401:
+// an outage must not read to the client as being signed out.
+func sessionAlive(c *gin.Context, sessionRepo repo.Repo[session.Session], claims *auth.Claims, userID uint) bool {
+	sid, err := uuid.Parse(claims.SID)
+	if err != nil {
+		unauthorized(c, "invalid or expired token")
+		return false
+	}
+	sess, err := sessionRepo.GetOne(c.Request.Context(), store.QueryOpts{Filters: map[string]any{"uuid": sid}})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		unauthorized(c, "session revoked")
+		return false
+	}
+	if err != nil {
+		_ = c.Error(err)
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, apicommon.Response[any]{Error: "auth_unavailable", Message: "session store unavailable"})
+		return false
+	}
+	if sess.UserID != userID || sess.RevokedAt != nil || time.Now().After(sess.AbsoluteExpiry) {
+		unauthorized(c, "session revoked")
+		return false
+	}
+	return true
+}
+
 // AdminAuth authenticates like UserAuth and additionally enforces admin role, before
 // anything downstream runs.
 func AdminAuth(
 	verifier auth.Verifier,
 	userRepo repo.Repo[user.User],
+	sessionRepo repo.Repo[session.Session],
 	redis *goredis.Client,
 	revocationFailOpen bool,
 ) gin.HandlerFunc {
-	authenticate := authenticator(verifier, userRepo, redis, revocationFailOpen)
+	authenticate := authenticator(verifier, userRepo, sessionRepo, redis, revocationFailOpen)
 
 	return func(c *gin.Context) {
 		if !authenticate(c) {

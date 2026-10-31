@@ -33,6 +33,15 @@ type JWTConfig struct {
 	RefreshTokenExpiry time.Duration
 }
 
+// AuthSecurityConfig holds session policy.
+type AuthSecurityConfig struct {
+	// SessionAbsoluteTTL is the hard cap on a session; refreshing never extends it.
+	SessionAbsoluteTTL time.Duration
+	// RefreshRaceWindow is how long after a rotation the previous refresh token counts as a
+	// concurrent caller rather than a replay.
+	RefreshRaceWindow time.Duration
+}
+
 type GoogleOAuthConfig struct {
 	ClientID     string
 	ClientSecret string
@@ -95,11 +104,12 @@ type Config struct {
 
 	// --- Dependency toggles ---
 	// Whether optional backing services are wired at startup. DB is always
-	// required. Disabling Redis turns off auth/rate-limit/revocation features.
+	// required. Disabling Redis turns off rate limiting and the access-token
+	// denylist; sessions live in Postgres, so auth keeps working.
 	S3Enabled    bool
 	RedisEnabled bool
 
-	// When the revocation store (Redis) cannot be queried: true accepts the
+	// When the access-token denylist (Redis) cannot be queried: true accepts the
 	// token (favours availability), false rejects with 503 (favours revocation
 	// guarantees). Defaults to false — fail closed.
 	AuthRevocationFailOpen bool
@@ -128,6 +138,9 @@ type Config struct {
 	// --- JWT Settings ---
 	JWT JWTConfig
 
+	// --- Session Settings ---
+	AuthSecurity AuthSecurityConfig
+
 	// --- Redis Settings ---
 	Redis RedisConfig
 
@@ -154,13 +167,15 @@ func Load() Config {
 	}
 
 	cfg := Config{
-		Env:       getEnv("APP_ENV", "dev"),
-		Port:      getEnv("APP_PORT", "8080"),
-		LogLevel:  getEnv("APP_LOG_LEVEL", "debug"),
-		S3:        loadS3(),
-		JWT:       loadJWT(),
-		Redis:     loadRedis(),
-		RateLimit: loadRateLimitConfig(),
+		Env:      getEnv("APP_ENV", "dev"),
+		Port:     getEnv("APP_PORT", "8080"),
+		LogLevel: getEnv("APP_LOG_LEVEL", "debug"),
+		S3:       loadS3(),
+		JWT:      loadJWT(),
+		Redis:    loadRedis(),
+
+		AuthSecurity: loadAuthSecurity(),
+		RateLimit:    loadRateLimitConfig(),
 		// Fail closed: an unset value means no cross-origin requests are allowed,
 		// rather than silently allowing every origin in production.
 		CORSAllowedOrigins: parseCSV("CORS_ALLOWED_ORIGINS", ""),
@@ -190,7 +205,7 @@ func Load() Config {
 	cfg.TrustedProxies = parseCSV("TRUSTED_PROXIES", "")
 
 	// Dependency toggles. S3 is off by default (no local default), Redis is on
-	// (auth needs it) and the default Compose stack starts it.
+	// (rate limiting needs it) and the default Compose stack starts it.
 	cfg.S3Enabled = parseBool("S3_ENABLED", false)
 	cfg.RedisEnabled = parseBool("REDIS_ENABLED", true)
 	cfg.AuthRevocationFailOpen = parseBool("AUTH_REVOCATION_FAIL_OPEN", false)
@@ -207,6 +222,13 @@ func loadJWT() JWTConfig {
 		TokenAudience:      getEnv("JWT_AUDIENCE", "YOUR_APP_NAME"),
 		TokenExpiration:    parseDuration("JWT_ACCESS_EXPIRY", 15*time.Minute),
 		RefreshTokenExpiry: parseDuration("JWT_REFRESH_EXPIRY", 168*time.Hour), // 7 days
+	}
+}
+
+func loadAuthSecurity() AuthSecurityConfig {
+	return AuthSecurityConfig{
+		SessionAbsoluteTTL: parseDuration("SESSION_ABSOLUTE_TTL", 720*time.Hour), // 30 days
+		RefreshRaceWindow:  parseDuration("REFRESH_RACE_WINDOW", 30*time.Second),
 	}
 }
 

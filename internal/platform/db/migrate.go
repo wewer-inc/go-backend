@@ -3,6 +3,7 @@ package db
 import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/note"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/go-gormigrate/gormigrate/v2"
 	"github.com/rs/zerolog"
@@ -52,6 +53,15 @@ func migrations() []*gormigrate.Migration {
 			},
 			Rollback: func(tx *gorm.DB) error {
 				return tx.Migrator().DropTable(&audit.Log{})
+			},
+		},
+		{
+			ID: "0004_sessions",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.AutoMigrate(&session.Session{})
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return tx.Migrator().DropTable(&session.Session{})
 			},
 		},
 	}
