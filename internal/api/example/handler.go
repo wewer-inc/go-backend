@@ -5,8 +5,11 @@ import (
 	"net/http"
 
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/note"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/scopequery"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/gin-gonic/gin"
@@ -23,19 +26,20 @@ func NewHandler(r repo.Repo[note.Note]) *Handler {
 }
 
 func (h *Handler) List(c *gin.Context) {
-	userID, ok := middleware.GetActorUserID(c)
+	s, ok := middleware.GetActorSubject(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, apicommon.Response[any]{Error: "unauthorized"})
 		return
 	}
 
+	// The scope clause means this list cannot return rows outside the actor's reach.
 	notes, page, err := h.repo.List(c.Request.Context(), store.QueryOpts{
-		Filters:  map[string]any{"user_id": userID},
+		Where:    []store.Clause{scopequery.ForOwned(s, authz.ResNote, "user_id")},
 		Page:     1,
 		PageSize: 20,
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -64,7 +68,7 @@ func (h *Handler) Create(c *gin.Context) {
 
 	var req CreateNoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: "validation_error", Message: "invalid request body"})
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -76,7 +80,7 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 
 	if err := h.repo.Create(c.Request.Context(), n); err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -85,7 +89,7 @@ func (h *Handler) Create(c *gin.Context) {
 }
 
 func (h *Handler) Get(c *gin.Context) {
-	n, ok := h.fetchOwnedNote(c)
+	n, ok := h.fetchNote(c, authz.ActionRead)
 	if !ok {
 		return
 	}
@@ -94,14 +98,14 @@ func (h *Handler) Get(c *gin.Context) {
 }
 
 func (h *Handler) Update(c *gin.Context) {
-	n, ok := h.fetchOwnedNote(c)
+	n, ok := h.fetchNote(c, authz.ActionUpdate)
 	if !ok {
 		return
 	}
 
 	var req UpdateNoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apicommon.Response[any]{Error: "validation_error", Message: "invalid request body"})
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
@@ -113,7 +117,7 @@ func (h *Handler) Update(c *gin.Context) {
 	}
 
 	if err := h.repo.Update(c.Request.Context(), n); err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
@@ -122,22 +126,24 @@ func (h *Handler) Update(c *gin.Context) {
 }
 
 func (h *Handler) Delete(c *gin.Context) {
-	n, ok := h.fetchOwnedNote(c)
+	n, ok := h.fetchNote(c, authz.ActionDelete)
 	if !ok {
 		return
 	}
 
 	if err := h.repo.SoftDelete(c.Request.Context(), n.ID); err != nil {
-		c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+		respondInternal(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "note deleted"})
 }
 
-// fetchOwnedNote parses the UUID param, loads the note, and verifies ownership.
-func (h *Handler) fetchOwnedNote(c *gin.Context) (*note.Note, bool) {
-	userID, ok := middleware.GetActorUserID(c)
+// fetchNote parses the UUID param, loads the note, and decides whether the actor may
+// take the action on this row. A row out of the actor's reach answers 404, not 403, so
+// the API does not confirm that another user's note exists.
+func (h *Handler) fetchNote(c *gin.Context, action authz.Action) (*note.Note, bool) {
+	s, ok := middleware.GetActorSubject(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, apicommon.Response[any]{Error: "unauthorized"})
 		return nil, false
@@ -154,15 +160,27 @@ func (h *Handler) fetchOwnedNote(c *gin.Context) (*note.Note, bool) {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, apicommon.Response[any]{Error: "note_not_found"})
 		} else {
-			c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+			respondInternal(c, err)
 		}
 		return nil, false
 	}
 
-	if n.UserID != userID {
-		c.JSON(http.StatusForbidden, apicommon.Response[any]{Error: "forbidden"})
+	if d := authz.Decide(s, authz.ResNote, action, authz.ResourceRef{OwnerUserID: n.UserID}); !d.Allowed {
+		if d.Reason == authz.ReasonOutOfScope {
+			c.JSON(http.StatusNotFound, apicommon.Response[any]{Error: "note_not_found"})
+		} else {
+			c.JSON(http.StatusForbidden, apicommon.Response[any]{Error: "forbidden"})
+		}
 		return nil, false
 	}
 
 	return n, true
+}
+
+// respondInternal answers 500 with a generic body and hands the cause to the
+// request logger, so a failed request stays diagnosable by its request_id.
+func respondInternal(c *gin.Context, cause error) {
+	e := apierr.InternalErr(cause, "something went wrong")
+	_ = c.Error(e)
+	c.JSON(e.Status, apicommon.Response[any]{Error: e.Code, Message: e.Message})
 }

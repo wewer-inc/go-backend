@@ -41,7 +41,12 @@ make docker-up DB_PROFILE=true
 make test
 ```
 
-The pre-commit hook runs `fmt → vet → lint → gosec → test` before every commit. CI runs the same checks on every PR.
+The pre-commit hook runs `fmt → vet → lint → gosec → test` before every commit. On a PR, CI also runs the Postgres integration suite and the coverage gate. To run those locally:
+
+```bash
+make test && make cover-gate
+make test-pg TEST_DATABASE_URL=postgres://user:pass@localhost:5432/app_test?sslmode=disable
+```
 
 ---
 
@@ -106,3 +111,20 @@ For security issues, do **not** open a public issue. See [SECURITY.md](SECURITY.
 ## Code of Conduct
 
 This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you agree to uphold it.
+
+## Rules every module must honor
+
+- **Authorization:** gate every route with `RequirePermission` or `RequireCapability`, decide single
+  rows with `authz.Decide`, and scope lists with `scopequery`. A new role or resource needs its matrix,
+  scope and fixture entries, or the tests fail.
+- **Audit:** record create, update and delete of anything security-relevant through `auditlog`, with
+  field names and never sensitive values.
+- **Soft delete:** archive with `SoftDelete`; reach for `HardDelete` only with a stated reason.
+- **Lists:** server-side pagination, default sort and search. Escape search input with
+  `store.LikeContains` and `store.LikeEscape`.
+- **Errors:** return `apierr` values. An unexpected failure goes through `apierr.InternalErr`, so its
+  cause is logged and the client sees a generic message.
+- **Migrations:** add only, in a new migration ID. Destructive changes ship in a later deploy, after
+  the new code is fully rolled out, because the old revision keeps serving during a rollout or rollback.
+- **Tests:** real behavior over mocks. Anything sqlite cannot show gets a `//go:build integration` test
+  using `TEST_DATABASE_URL`. Coverage floors in `coverage-floors.txt` only rise.

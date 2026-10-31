@@ -12,6 +12,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
 	pdb "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/db"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/heartbeat"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/logger"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/objectstore"
 	redisstore "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/redis"
@@ -31,6 +32,7 @@ type App struct {
 	Mailer       email.Mailer
 	Worker       *worker.Worker
 	workerCancel context.CancelFunc
+	heartbeat    *heartbeat.Beater
 }
 
 // Build wires all dependencies and returns a ready-to-start App.
@@ -46,6 +48,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		ConnMaxLifetime: cfg.DB_CONN_LIFETIME,
 		ConnMaxIdleTime: cfg.DB_CONN_IDLE_TIME,
 		SlowThreshold:   cfg.DB_SLOW_THRESHOLD,
+		LogQueryValues:  cfg.DB_LOG_QUERY_VALUES,
 	}, log)
 	if err != nil {
 		return nil, err
@@ -72,7 +75,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		log.Info().Msg("s3: disabled (S3_ENABLED=false)")
 	}
 
-	// Redis is optional, but auth, rate limiting and token revocation require it.
+	// Redis is optional. Rate limiting and the access-token denylist need it; auth does not.
 	var redisClient *redisstore.Client
 	if cfg.RedisEnabled {
 		rc, err := redisstore.NewClient(cfg.Redis)
@@ -88,7 +91,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		}
 		redisClient = rc
 	} else {
-		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — auth, rate limiting and token revocation are unavailable")
+		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — rate limiting is unavailable; login lockout is the only brake on the auth endpoints")
 	}
 
 	// Email: real SMTP when a host is configured, noop otherwise. Production
@@ -119,6 +122,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		ObjStore: s3Store,
 		Redis:    redisClient,
 		Worker:   w,
+		Mailer:   mailer,
 	}
 
 	handler, err := httpserver.NewRouter(deps, build)
@@ -148,6 +152,29 @@ func Build(build versioning.BuildInfo) (*App, error) {
 	}, nil
 }
 
+// Migrate applies database migrations and exits. Run it as a one-off task before a
+// deploy, with DB_MIGRATE_ON_START=false on the service, so schema changes never race
+// across request-serving instances.
+func Migrate() error {
+	cfg := config.Load()
+	log := logger.NewLogger(cfg)
+	gdb, err := pdb.Start(context.Background(), pdb.Config{
+		DSN:             cfg.DB_DSN,
+		MigrateOnStart:  true,
+		MaxOpen:         1,
+		MaxIdle:         1,
+		ConnMaxLifetime: cfg.DB_CONN_LIFETIME,
+		ConnMaxIdleTime: cfg.DB_CONN_IDLE_TIME,
+		SlowThreshold:   cfg.DB_SLOW_THRESHOLD,
+		LogQueryValues:  cfg.DB_LOG_QUERY_VALUES,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	log.Info().Msg("migrate: complete")
+	return pdb.Stop(gdb)
+}
+
 func (a *App) Start() error {
 	// Bind the listener synchronously so a bind failure (e.g. port in use) is
 	// returned to the caller instead of only being logged from a goroutine.
@@ -164,6 +191,9 @@ func (a *App) Start() error {
 	a.workerCancel = cancel
 	a.Worker.Start(workerCtx)
 
+	a.heartbeat = heartbeat.New(a.log, heartbeat.Interval).WithFields(pdb.PoolStatsFields(a.db))
+	a.heartbeat.Start()
+
 	go func() {
 		if err := a.srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) && err != nil {
 			a.log.Error().Err(err).Msg("http: server error")
@@ -173,6 +203,10 @@ func (a *App) Start() error {
 }
 
 func (a *App) Stop(ctx context.Context) error {
+	if a.heartbeat != nil {
+		a.heartbeat.Stop()
+	}
+
 	if a == nil {
 		return nil
 	}

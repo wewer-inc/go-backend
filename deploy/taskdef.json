@@ -1,0 +1,36 @@
+{
+  "family": "${TASK_FAMILY}",
+  "executionRoleArn": "${EXEC_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "${TASK_CPU}",
+  "memory": "${TASK_MEMORY}",
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "${IMAGE}",
+      "essential": true,
+      "stopTimeout": 30,
+      "portMappings": [{ "containerPort": 8080, "protocol": "tcp" }],
+      "environment": [
+        { "name": "APP_ENV", "value": "${APP_ENV}" },
+        { "name": "APP_PORT", "value": "8080" },
+        { "name": "DB_MIGRATE_ON_START", "value": "false" }
+      ],
+      "secrets": [
+        { "name": "DB_DSN", "valueFrom": "${SECRET_ARN}:DB_DSN::" },
+        { "name": "JWT_SECRET", "valueFrom": "${SECRET_ARN}:JWT_SECRET::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "backend"
+        }
+      }
+    }
+  ]
+}

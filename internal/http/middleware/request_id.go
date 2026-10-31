@@ -3,14 +3,11 @@ package middleware
 import (
 	"context"
 
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/reqid"
 	utilsconst "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/utils/const"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/utils/generate"
 	"github.com/gin-gonic/gin"
 )
-
-type ctxKey int
-
-const requestIDKey ctxKey = iota
 
 // RequestIDMiddleware ensures each request carries a unique request ID, echoed
 // in the response header and — crucially — stored in the request context so the
@@ -25,8 +22,7 @@ func RequestIDMiddleware() gin.HandlerFunc {
 		c.Writer.Header().Set(utilsconst.ReqIDHeader, id)
 		c.Set(utilsconst.ReqIDHeader, id)
 
-		ctx := context.WithValue(c.Request.Context(), requestIDKey, id)
-		c.Request = c.Request.WithContext(ctx)
+		c.Request = c.Request.WithContext(reqid.NewContext(c.Request.Context(), id))
 
 		c.Next()
 	}
@@ -34,8 +30,5 @@ func RequestIDMiddleware() gin.HandlerFunc {
 
 // RequestIDFromContext returns the request ID stored in ctx, or "" if absent.
 func RequestIDFromContext(ctx context.Context) string {
-	if id, ok := ctx.Value(requestIDKey).(string); ok {
-		return id
-	}
-	return ""
+	return reqid.FromContext(ctx)
 }

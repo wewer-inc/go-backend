@@ -37,6 +37,31 @@ func (m *Middleware) Auth() gin.HandlerFunc {
 	return m.BucketHandler(BucketAuth, m.cfg.Auth)
 }
 
+// Keyed limits by the string keyFn returns and ignores the actor and IP, which suits machine
+// callers such as those holding a partner API key. A request with no key is rejected.
+func (m *Middleware) Keyed(bucket Bucket, bcfg config.RateLimitBucketConfig, keyFn func(*gin.Context) string) gin.HandlerFunc {
+	prefix := "rl:" + string(bucket) + ":key:"
+	return func(c *gin.Context) {
+		if m.cfg.Enabled && !m.admitKey(c, prefix, keyFn(c), bcfg) {
+			return
+		}
+		c.Next()
+	}
+}
+
+func (m *Middleware) admitKey(c *gin.Context, prefix, id string, bcfg config.RateLimitBucketConfig) bool {
+	if id == "" {
+		m.respondRateLimited(c, 1)
+		return false
+	}
+	allowed, retryAfterSec, err := m.limiter.Allow(c.Request.Context(), prefix+id, bcfg)
+	if err == nil && allowed {
+		return true
+	}
+	m.respondRateLimited(c, max(retryAfterSec, 1))
+	return false
+}
+
 func (m *Middleware) BucketHandler(bucket Bucket, bcfg config.RateLimitBucketConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !m.cfg.Enabled {
@@ -83,9 +108,13 @@ func (m *Middleware) BucketHandler(bucket Bucket, bcfg config.RateLimitBucketCon
 	}
 }
 
+// respondRateLimited sends the 429 and stops the chain. Sending alone would not limit
+// anything: Context.Next runs middleware in a loop that a plain return does not break, so
+// the rejected request would carry on to its handler, do all its database work and append
+// a second JSON body to the response.
 func (m *Middleware) respondRateLimited(c *gin.Context, retryAfterSeconds int) {
 	c.Header("Retry-After", strconv.Itoa(retryAfterSeconds))
-	c.JSON(http.StatusTooManyRequests, apicommon.Response[any]{
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, apicommon.Response[any]{
 		Error:   "rate_limited",
 		Message: "too many requests",
 	})

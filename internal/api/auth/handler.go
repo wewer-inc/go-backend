@@ -4,11 +4,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 	"github.com/gin-gonic/gin"
 )
 
@@ -23,14 +25,22 @@ func NewHandler(svc *Service, secureCookies bool) *Handler {
 	return &Handler{svc: svc, secure: secureCookies}
 }
 
+func loginContext(c *gin.Context) LoginContext {
+	ua := c.Request.UserAgent()
+	if len(ua) > maxUserAgentLen {
+		ua = ua[:maxUserAgentLen]
+	}
+	return LoginContext{UserAgent: ua, IP: c.ClientIP()}
+}
+
 func (h *Handler) Register(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, apierr.BadRequest("validation_error", "invalid request body"))
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
-	resp, err := h.svc.Register(c.Request.Context(), req)
+	resp, err := h.svc.Register(c.Request.Context(), req, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
@@ -42,27 +52,128 @@ func (h *Handler) Register(c *gin.Context) {
 func (h *Handler) Login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, apierr.BadRequest("validation_error", "invalid request body"))
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
-	resp, err := h.svc.Login(c.Request.Context(), req)
+	resp, challenge, err := h.svc.Login(c.Request.Context(), req, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
 	}
+	if challenge != nil {
+		c.JSON(http.StatusOK, apicommon.Response[MFAChallengeResponse]{Data: challenge})
+		return
+	}
 
 	c.JSON(http.StatusOK, apicommon.Response[AuthResponse]{Data: resp})
+}
+
+// MFAVerify completes a sign-in that was answered with a challenge.
+func (h *Handler) MFAVerify(c *gin.Context) {
+	var req MFAVerifyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	resp, err := h.svc.VerifyMFA(c.Request.Context(), req, loginContext(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[AuthResponse]{Data: resp})
+}
+
+// MFAEnrollStart begins turning MFA on for the caller.
+func (h *Handler) MFAEnrollStart(c *gin.Context) {
+	var req MFAEnrollStartRequest
+	// An empty body is fine for an account with no password to send.
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	resp, err := h.svc.StartEnrollment(c.Request.Context(), userID, claims.SID, req.CurrentPassword)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[EnrollStartResponse]{Data: resp})
+}
+
+// MFAEnrollConfirm finishes turning MFA on and serves the backup codes, once.
+func (h *Handler) MFAEnrollConfirm(c *gin.Context) {
+	var req MFACodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	codes, err := h.svc.ConfirmEnrollment(c.Request.Context(), userID, claims.SID, req.Code, c.ClientIP())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[BackupCodesResponse]{Data: &BackupCodesResponse{BackupCodes: codes}})
+}
+
+// MFAStatus serves whether MFA is on and how many backup codes are left.
+func (h *Handler) MFAStatus(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	resp, err := h.svc.Status(c.Request.Context(), userID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[MFAStatusResponse]{Data: resp})
+}
+
+// MFARegenerateBackupCodes replaces the caller's backup codes.
+func (h *Handler) MFARegenerateBackupCodes(c *gin.Context) {
+	var req MFARegenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	codes, err := h.svc.RegenerateBackupCodes(c.Request.Context(), userID, claims.SID, req.CurrentPassword, req.Code, c.ClientIP())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[BackupCodesResponse]{Data: &BackupCodesResponse{BackupCodes: codes}})
+}
+
+// AdminResetMFA clears another user's MFA.
+func (h *Handler) AdminResetMFA(c *gin.Context) {
+	var req AdminResetMFARequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	s, ok := middleware.GetActorSubject(c)
+	if !ok {
+		respondError(c, apierr.Unauthorized("unauthorized"))
+		return
+	}
+	if err := h.svc.AdminResetMFA(c.Request.Context(), s.UserID, c.Param("uuid"), req.StepUpCode, c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "two-factor authentication reset"})
 }
 
 func (h *Handler) Refresh(c *gin.Context) {
 	var req RefreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, apierr.BadRequest("validation_error", "invalid request body"))
+		apicommon.RespondBindError(c, err)
 		return
 	}
 
-	resp, err := h.svc.RefreshTokens(c.Request.Context(), req.RefreshToken)
+	resp, err := h.svc.RefreshTokens(c.Request.Context(), req.RefreshToken, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
@@ -71,21 +182,97 @@ func (h *Handler) Refresh(c *gin.Context) {
 	c.JSON(http.StatusOK, apicommon.Response[AuthResponse]{Data: resp})
 }
 
-// Logout revokes the caller's access token and (optionally) a supplied refresh
-// session. It is mounted on the authenticated routes, so the access claims are
-// already present in context.
+// Logout revokes the caller's session and (optionally) a supplied refresh session. It is
+// mounted on the authenticated routes, so the access claims are already in context.
 func (h *Handler) Logout(c *gin.Context) {
 	var req LogoutRequest
-	// Body is optional; ignore bind errors and fall back to access-token-only revocation.
+	// Body is optional; ignore bind errors and fall back to the current session only.
 	_ = c.ShouldBindJSON(&req)
 
 	claims, _ := middleware.GetActorClaims(c)
-	if err := h.svc.Logout(c.Request.Context(), claims, req.RefreshToken); err != nil {
+	userID, _ := middleware.GetActorUserID(c)
+	if err := h.svc.Logout(c.Request.Context(), userID, claims, req.RefreshToken, c.ClientIP()); err != nil {
 		respondError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "logged out"})
+}
+
+// ChangePassword changes the caller's password.
+func (h *Handler) ChangePassword(c *gin.Context) {
+	var req ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	if err := h.svc.ChangePassword(c.Request.Context(), userID, claims.SID, req, c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "password changed"})
+}
+
+// ForgotPassword always answers the same way for a well-formed address, known or not. A
+// malformed one is refused, which says something about the request and nothing about any
+// account.
+func (h *Handler) ForgotPassword(c *gin.Context) {
+	var req ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	h.svc.RequestPasswordReset(req.Email, loginContext(c))
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "if that address has an account, a reset link is on its way"})
+}
+
+// ResetPassword redeems an emailed reset token.
+func (h *Handler) ResetPassword(c *gin.Context) {
+	var req ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	if err := h.svc.ResetPassword(c.Request.Context(), req, loginContext(c)); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "password reset"})
+}
+
+// ListSessions serves the caller's live sessions.
+func (h *Handler) ListSessions(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	views, err := h.svc.ListSessions(c.Request.Context(), userID, claims.SID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[[]SessionView]{Data: &views})
+}
+
+// RevokeSession ends the session named by the sid path parameter.
+func (h *Handler) RevokeSession(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	if err := h.svc.RevokeSession(c.Request.Context(), userID, c.Param("sid"), c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "session revoked"})
+}
+
+// RevokeOtherSessions signs the caller out everywhere but this session.
+func (h *Handler) RevokeOtherSessions(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	if err := h.svc.RevokeOtherSessions(c.Request.Context(), userID, claims.SID, c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "other sessions revoked"})
 }
 
 func (h *Handler) GoogleRedirect(c *gin.Context) {
@@ -125,9 +312,13 @@ func (h *Handler) GoogleCallback(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.GoogleCallback(c.Request.Context(), code)
+	resp, challenge, err := h.svc.GoogleCallback(c.Request.Context(), code, loginContext(c))
 	if err != nil {
 		respondError(c, err)
+		return
+	}
+	if challenge != nil {
+		c.JSON(http.StatusOK, apicommon.Response[MFAChallengeResponse]{Data: challenge})
 		return
 	}
 
@@ -145,10 +336,30 @@ func randomState() (string, error) {
 
 // respondError maps *apierr.APIError to its HTTP status, falls back to 500.
 func respondError(c *gin.Context, err error) {
+	// Attaching the error lets the request logger record the cause under its request_id.
+	// Only the code, message and details go into the response.
+	_ = c.Error(err)
 	var apiErr *apierr.APIError
 	if errors.As(err, &apiErr) {
-		c.JSON(apiErr.Status, apicommon.Response[any]{Error: apiErr.Code, Message: apiErr.Message})
+		c.JSON(apiErr.Status, apicommon.Response[any]{Error: apiErr.Code, Message: apiErr.Message, Details: apiErr.Details})
 		return
 	}
 	c.JSON(http.StatusInternalServerError, apicommon.Response[any]{Error: "internal_error"})
+}
+
+// Permissions serves the actor's action set so a client can show only what will work.
+// It is a convenience for the interface: the server still enforces every decision.
+func (h *Handler) Permissions(c *gin.Context) {
+	s, ok := middleware.GetActorSubject(c)
+	if !ok {
+		respondError(c, apierr.Unauthorized("unauthorized"))
+		return
+	}
+	resp := PermissionsResponse{
+		Role:         s.Role,
+		Permissions:  authz.PermissionsFor(s.Role),
+		Capabilities: authz.CapabilitiesFor(s.Role),
+		Scopes:       authz.ScopesFor(s.Role),
+	}
+	c.JSON(http.StatusOK, apicommon.Response[PermissionsResponse]{Data: &resp})
 }

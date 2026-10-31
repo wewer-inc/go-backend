@@ -33,6 +33,39 @@ type JWTConfig struct {
 	RefreshTokenExpiry time.Duration
 }
 
+// AuthSecurityConfig groups the sign-in settings: how long a session lasts, when an address
+// is locked out, and the rules for password resets and reuse.
+type AuthSecurityConfig struct {
+	// SessionAbsoluteTTL is the hard cap on a session; refreshing never extends it.
+	SessionAbsoluteTTL time.Duration
+	// RefreshRaceWindow is how long after a rotation the previous refresh token counts as a
+	// concurrent caller rather than a replay.
+	RefreshRaceWindow time.Duration
+	// LockoutThreshold is failed sign-ins per address before lockout; 0 disables it.
+	LockoutThreshold int
+	LockoutWindow    time.Duration
+	// PasswordResetURL is the page in your client that takes the emailed token. Reset emails
+	// are not sent while it is empty.
+	PasswordResetURL string
+	PasswordResetTTL time.Duration
+	// PasswordResetCooldown is the minimum gap between reset emails to one account.
+	PasswordResetCooldown time.Duration
+	// PasswordHistoryCount is how many previous passwords a new one must differ from.
+	PasswordHistoryCount int
+}
+
+// MFAConfig holds TOTP settings.
+type MFAConfig struct {
+	// EncryptionKey protects TOTP secrets at rest. With no valid key, enrollment is refused
+	// rather than falling back to plaintext. Changing it strands every enrolled secret.
+	EncryptionKey   string
+	Issuer          string
+	EnrollTTL       time.Duration
+	ChallengeTTL    time.Duration
+	MaxAttempts     int
+	BackupCodeCount int
+}
+
 type GoogleOAuthConfig struct {
 	ClientID     string
 	ClientSecret string
@@ -95,11 +128,12 @@ type Config struct {
 
 	// --- Dependency toggles ---
 	// Whether optional backing services are wired at startup. DB is always
-	// required. Disabling Redis turns off auth/rate-limit/revocation features.
+	// required. Disabling Redis turns off rate limiting and the access-token
+	// denylist; sessions live in Postgres, so auth keeps working.
 	S3Enabled    bool
 	RedisEnabled bool
 
-	// When the revocation store (Redis) cannot be queried: true accepts the
+	// When the access-token denylist (Redis) cannot be queried: true accepts the
 	// token (favours availability), false rejects with 503 (favours revocation
 	// guarantees). Defaults to false — fail closed.
 	AuthRevocationFailOpen bool
@@ -120,12 +154,19 @@ type Config struct {
 	DB_CONN_LIFETIME    time.Duration
 	DB_CONN_IDLE_TIME   time.Duration
 	DB_SLOW_THRESHOLD   time.Duration
+	DB_LOG_QUERY_VALUES bool
 
 	// --- S3 Settings ---
 	S3 S3Config
 
 	// --- JWT Settings ---
 	JWT JWTConfig
+
+	// --- Session Settings ---
+	AuthSecurity AuthSecurityConfig
+
+	// --- Two-factor Authentication ---
+	MFA MFAConfig
 
 	// --- Redis Settings ---
 	Redis RedisConfig
@@ -153,13 +194,16 @@ func Load() Config {
 	}
 
 	cfg := Config{
-		Env:       getEnv("APP_ENV", "dev"),
-		Port:      getEnv("APP_PORT", "8080"),
-		LogLevel:  getEnv("APP_LOG_LEVEL", "debug"),
-		S3:        loadS3(),
-		JWT:       loadJWT(),
-		Redis:     loadRedis(),
-		RateLimit: loadRateLimitConfig(),
+		Env:      getEnv("APP_ENV", "dev"),
+		Port:     getEnv("APP_PORT", "8080"),
+		LogLevel: getEnv("APP_LOG_LEVEL", "debug"),
+		S3:       loadS3(),
+		JWT:      loadJWT(),
+		Redis:    loadRedis(),
+
+		AuthSecurity: loadAuthSecurity(),
+		MFA:          loadMFA(),
+		RateLimit:    loadRateLimitConfig(),
 		// Fail closed: an unset value means no cross-origin requests are allowed,
 		// rather than silently allowing every origin in production.
 		CORSAllowedOrigins: parseCSV("CORS_ALLOWED_ORIGINS", ""),
@@ -181,6 +225,7 @@ func Load() Config {
 	cfg.DB_CONN_LIFETIME = parseDuration("DB_CONN_LIFETIME", 30*time.Minute)
 	cfg.DB_CONN_IDLE_TIME = parseDuration("DB_CONN_IDLE_TIME", 9*time.Minute)
 	cfg.DB_SLOW_THRESHOLD = parseDuration("DB_SLOW_THRESHOLD", 200*time.Millisecond)
+	cfg.DB_LOG_QUERY_VALUES = parseBool("DB_LOG_QUERY_VALUES", false)
 
 	// HTTP hardening (defaults: 1 MiB body, 1 MiB headers)
 	cfg.MaxRequestBodyBytes = int64(parseInt("HTTP_MAX_BODY_BYTES", 1<<20))
@@ -188,7 +233,7 @@ func Load() Config {
 	cfg.TrustedProxies = parseCSV("TRUSTED_PROXIES", "")
 
 	// Dependency toggles. S3 is off by default (no local default), Redis is on
-	// (auth needs it) and the default Compose stack starts it.
+	// (rate limiting needs it) and the default Compose stack starts it.
 	cfg.S3Enabled = parseBool("S3_ENABLED", false)
 	cfg.RedisEnabled = parseBool("REDIS_ENABLED", true)
 	cfg.AuthRevocationFailOpen = parseBool("AUTH_REVOCATION_FAIL_OPEN", false)
@@ -205,6 +250,32 @@ func loadJWT() JWTConfig {
 		TokenAudience:      getEnv("JWT_AUDIENCE", "YOUR_APP_NAME"),
 		TokenExpiration:    parseDuration("JWT_ACCESS_EXPIRY", 15*time.Minute),
 		RefreshTokenExpiry: parseDuration("JWT_REFRESH_EXPIRY", 168*time.Hour), // 7 days
+	}
+}
+
+func loadAuthSecurity() AuthSecurityConfig {
+	return AuthSecurityConfig{
+		SessionAbsoluteTTL: parseDuration("SESSION_ABSOLUTE_TTL", 720*time.Hour), // 30 days
+		RefreshRaceWindow:  parseDuration("REFRESH_RACE_WINDOW", 30*time.Second),
+
+		LockoutThreshold: parseInt("AUTH_LOCKOUT_THRESHOLD", 5),
+		LockoutWindow:    parseDuration("AUTH_LOCKOUT_WINDOW", 15*time.Minute),
+
+		PasswordResetURL:      os.Getenv("PASSWORD_RESET_URL"),
+		PasswordResetTTL:      parseDuration("PASSWORD_RESET_TTL", time.Hour),
+		PasswordResetCooldown: parseDuration("PASSWORD_RESET_COOLDOWN", 2*time.Minute),
+		PasswordHistoryCount:  parseInt("PASSWORD_HISTORY_COUNT", 3),
+	}
+}
+
+func loadMFA() MFAConfig {
+	return MFAConfig{
+		EncryptionKey:   os.Getenv("MFA_ENCRYPTION_KEY"),
+		Issuer:          getEnv("MFA_ISSUER", "YOUR_APP_NAME"),
+		EnrollTTL:       parseDuration("MFA_ENROLL_TTL", 15*time.Minute),
+		ChallengeTTL:    parseDuration("MFA_CHALLENGE_TTL", 5*time.Minute),
+		MaxAttempts:     parseInt("MFA_MAX_ATTEMPTS", 5),
+		BackupCodeCount: parseInt("MFA_BACKUP_CODE_COUNT", 10),
 	}
 }
 

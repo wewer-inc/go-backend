@@ -34,6 +34,10 @@ type QueryOpts struct {
 
 	// Explicit columns to select
 	Select []string
+
+	// Unscoped includes soft-deleted rows. Reach for it only on a read that must
+	// still find a row after it was soft-deleted, never on a write path.
+	Unscoped bool
 }
 
 // PageInfo contains pagination metadata for query results

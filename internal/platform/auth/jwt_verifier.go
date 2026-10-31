@@ -17,10 +17,13 @@ var (
 
 // Claims is the validated, caller-facing view of a verified token.
 type Claims struct {
-	Subject   string
-	TokenUse  TokenUse
-	JTI       string
-	ExpiresAt time.Time
+	Subject  string
+	TokenUse TokenUse
+	JTI      string
+	SID      string
+	// Impersonator is the act claim: who is behind a "login as" session, zero otherwise.
+	Impersonator uint
+	ExpiresAt    time.Time
 }
 
 type Verifier interface {
@@ -47,8 +50,7 @@ func NewJWTVerifier(secret, issuer, audience string) *JWTVerifier {
 // subject, expiry, and — when configured — the issuer and audience claims.
 //
 // Note: this does NOT check token_use. Each call site is responsible for
-// asserting claims.TokenUse so a refresh token cannot be replayed as an
-// access token (and vice versa).
+// asserting claims.TokenUse, so nothing but an access token is accepted as one.
 func (v *JWTVerifier) Verify(tokenString string) (*Claims, error) {
 	opts := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{"HS256"}),
@@ -88,6 +90,9 @@ func (v *JWTVerifier) Verify(tokenString string) (*Claims, error) {
 		Subject:  claims.Subject,
 		TokenUse: claims.TokenUse,
 		JTI:      claims.ID,
+		SID:      claims.SID,
+
+		Impersonator: claims.Act,
 	}
 	if claims.ExpiresAt != nil {
 		out.ExpiresAt = claims.ExpiresAt.Time

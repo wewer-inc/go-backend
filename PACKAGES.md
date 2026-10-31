@@ -11,31 +11,51 @@ Short, opinionated conventions for naming and structuring packages in this boile
 ├── cmd/server/                   # Binary entry point. Wires app.Build() + signal handling. No logic.
 └── internal/
     ├── api/
-    │   ├── auth/                 # Auth feature: service + handlers + routes + transports
-    │   ├── common/               # Shared response envelope: Response[T]
-    │   └── example/              # Example Note CRUD — copy-paste template for new features
+    │   ├── adminaudit/           # Read and verify the audit trail
+    │   ├── auth/                 # Sign-in, sessions, passwords, two-factor, "login as"
+    │   ├── common/               # Shared response envelope and request binding
+    │   ├── example/              # Example Note CRUD — copy-paste template for new features
+    │   └── users/                # Admin role changes
     ├── apierr/                   # Typed API errors with HTTP status codes
     ├── app/                      # Dependency injection root: app.Build() wires everything
     ├── entities/
     │   ├── role.go               # Typed Role constants (RoleUser, RoleAdmin, RoleSupport)
+    │   ├── audit/                # Audit trail rows and event names
+    │   ├── loginfailure/         # Failed sign-in counters behind lockout
+    │   ├── mfa/                  # TOTP enrollment, challenges, backup codes
+    │   ├── passwordhistory/      # Previous password hashes
+    │   ├── passwordreset/        # Single-use reset tokens
+    │   ├── session/              # Sessions and retired refresh tokens
     │   ├── user/                 # User entity
     │   └── note/                 # Example entity
     ├── http/
-    │   ├── middleware/           # Request ID, logger, auth (UserAuth/AdminAuth), CORS
+    │   ├── middleware/           # Request ID, logger, auth, permission gates, body checks
     │   │   └── ratelimit/        # GCRA rate limiter middleware backed by Redis
     │   └── server/               # NewRouter: wires all middleware and feature routes
     ├── platform/
-    │   ├── auth/                 # JWT verifier + issuer (token sign/verify)
+    │   ├── auditlog/             # Hash-chained audit recorder and verifier
+    │   ├── auth/                 # JWT verifier + issuer, opaque tokens, password policy
+    │   ├── authz/                # Pure access policy: matrix, scope, capabilities
     │   ├── config/               # Config struct loaded from environment variables
-    │   ├── db/                   # GORM + PostgreSQL setup, migration runner
+    │   ├── crypto/               # AES-GCM for secrets at rest
+    │   ├── db/                   # GORM + PostgreSQL setup, migration runner, SQL log redaction
+    │   ├── dbstats/              # Per-request query count and time
     │   ├── email/                # Mailer interface, SMTPMailer, NoopMailer
+    │   ├── heartbeat/            # Periodic liveness log line
     │   ├── logger/               # Zerolog setup (JSON in prod, pretty in dev)
     │   ├── metrics/              # Prometheus middleware + /metrics handler
     │   ├── objectstore/          # S3-compatible storage interface + AWS implementation
+    │   ├── pgdialect/            # pgx settings shared by every pool
+    │   ├── pgtest/               # Postgres harness for integration-tagged tests
     │   ├── redis/                # Redis client wrapper
+    │   ├── reqid/                # Request ID on the context
+    │   ├── scopequery/           # Applies an authz scope to a list query
+    │   ├── sessions/             # Session revocation shared across modules
     │   └── versioning/           # BuildInfo for /version endpoint
     ├── store/
     │   ├── repo/                 # Generic Repo[T] interface + GormRepo[T] implementation
+    │   ├── expect.go             # ExpectError: keep an anticipated statement error out of the SQL log
+    │   ├── like.go               # Escaped LIKE patterns for search input
     │   ├── query.go              # QueryOpts DSL: filters, WHERE clauses, sort, pagination, preloads
     │   └── tx.go                 # WithTx helper for database transactions
     ├── utils/
@@ -104,13 +124,15 @@ r.List(ctx, store.QueryOpts{
 // Partial update (no hooks)
 r.UpdateColumnsByID(ctx, id, map[string]any{"status": "active"})
 
+// Update only while a column still holds the expected value (compare-and-set)
+r.UpdateColumnsGuarded(ctx, id, map[string]any{"status": "pending"}, nil, map[string]any{"status": "active"})
+
 // Soft delete
 r.SoftDelete(ctx, id)
 
 // Transaction
-store.WithTx(ctx, db, func(tx *gorm.DB) error {
-    txRepo := repo.NewGormRepo[note.Note](tx)
-    return txRepo.Create(ctx, &note.Note{...})
+store.WithTx(ctx, db, func(ctx context.Context, tx *gorm.DB) error {
+    return r.Create(ctx, &note.Note{...}) // r joins the transaction through ctx
 })
 ```
 
@@ -124,8 +146,9 @@ store.WithTx(ctx, db, func(tx *gorm.DB) error {
 4. `internal/api/<feature>/handler.go` — HTTP handlers
 5. `internal/api/<feature>/routes.go` — wire routes
 6. `internal/http/server/server.go` — call `<feature>.RegisterRoutes(...)`
+7. `internal/platform/authz` — add the resource and an entry for every role, then gate each route with `RequirePermission`
 
 If the feature needs emailing or background jobs:
 
-7. `internal/api/<feature>/service.go` — business logic layer
-8. Inject `email.Mailer` or `*worker.Worker` from `httpserver.Deps`
+8. `internal/api/<feature>/service.go` — business logic layer
+9. Inject `email.Mailer` or `*worker.Worker` from `httpserver.Deps`

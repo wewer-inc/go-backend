@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,6 +21,11 @@ var ErrStopped = errors.New("worker: stopped")
 var jobsDropped = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "worker_jobs_dropped_total",
 	Help: "Number of jobs dropped because the worker queue was full.",
+})
+
+var jobsPanicked = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "worker_jobs_panicked_total",
+	Help: "Number of jobs that panicked and were recovered.",
 })
 
 // Job is a unit of work executed asynchronously.
@@ -59,15 +65,34 @@ func (w *Worker) Start(ctx context.Context) {
 					if !ok {
 						return
 					}
-					if err := job(ctx); err != nil {
-						w.log.Error().Err(err).Msg("worker: job failed")
-					}
+					w.runJob(ctx, job)
 				case <-ctx.Done():
 					return
 				}
 			}
 		}()
 	}
+}
+
+// runJob runs job and contains any panic. Left uncaught, a panic on one of the pool's
+// goroutines would end the process, along with every request in flight, over one bad job.
+func (w *Worker) runJob(ctx context.Context, job Job) {
+	defer w.containPanic()
+	if err := job(ctx); err != nil {
+		w.log.Error().Err(err).Msg("worker: job failed")
+	}
+}
+
+func (w *Worker) containPanic() {
+	cause := recover()
+	if cause == nil {
+		return
+	}
+	jobsPanicked.Inc()
+	w.log.Error().
+		Interface("panic", cause).
+		Bytes("stack", debug.Stack()).
+		Msg("worker: job panicked")
 }
 
 // Enqueue submits a job. It is non-blocking; if the queue is full it returns

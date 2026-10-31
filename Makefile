@@ -17,6 +17,7 @@ MAIN           ?= ./cmd/server
 BIN_DIR        ?= ./.bin
 BUILD_DIR      ?= ./.build
 COVER_DIR      ?= ./.coverage
+COVERPKG       ?= ./internal/...
 GO             ?= go
 
 # Ensure local tools are on PATH
@@ -50,6 +51,8 @@ GOLANGCI_VERSION ?= v2.12.2
 STATICCHECK_VERSION ?= 2026.1
 GOVULNCHECK_VERSION ?= v1.2.0
 GOSEC_VERSION ?= v2.27.1
+GREMLINS_VERSION ?= v0.6.0
+MUTATE_PKGS ?= internal/platform/authz internal/platform/auth internal/http/middleware internal/http/middleware/ratelimit
 
 # Docker/Compose
 DOCKER         ?= docker
@@ -194,7 +197,32 @@ gosec-report: ## Run gosec and output JSON report
 .PHONY: test
 test: ## Run unit tests with coverage
 	@mkdir -p $(COVER_DIR)
-	$(GO) test $(PKG) -race -covermode=atomic -coverprofile=$(COVER_DIR)/coverage.out
+	@# -count=1 disables the test cache, matching CI: a cached profile can describe a tree
+	@# that no longer exists, and a gate reading stale coverage passes code it never saw.
+	$(GO) test $(PKG) -race -count=1 -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVER_DIR)/coverage.out
+
+.PHONY: test-pg
+test-pg: ## Run integration-tagged tests against real Postgres (needs TEST_DATABASE_URL)
+	@if [ -z "$(TEST_DATABASE_URL)" ]; then \
+		echo "$(YELLOW)set TEST_DATABASE_URL to a throwaway Postgres, e.g.$(RESET)"; \
+		echo "  docker run -d --name pgtest -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16-alpine"; \
+		echo "  make test-pg TEST_DATABASE_URL='postgres://postgres:pw@localhost:55433/postgres?sslmode=disable'"; \
+		exit 1; \
+	fi
+	@# -p 1: these suites share one database, so packages must not run in parallel.
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" $(GO) test -tags=integration -p 1 -count=1 $(PKG)
+
+.PHONY: cover-gate
+cover-gate: ## Fail if a package is under its coverage-floors.txt value | Needs 'make test' output
+	@COVERAGE_ENFORCE=1 ./scripts/coverage-gate.sh $(COVER_DIR)/coverage.out
+
+.PHONY: mutate
+mutate: ## Run gremlins on the packages that guard security | Slow, so PR CI skips it
+	@command -v gremlins >/dev/null || { echo "install: go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; exit 1; }
+	@for p in $(MUTATE_PKGS); do \
+		echo "> gremlins: $$p"; \
+		( cd $$p && gremlins unleash . ) || exit 1; \
+	done
 
 .PHONY: cover
 cover: ## Show coverage report in terminal | Requires 'make test' first

@@ -2,9 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,76 +11,157 @@ import (
 
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/mfa"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
-	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
+	appcrypto "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/crypto"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"gorm.io/gorm"
 )
 
-const refreshTokenPrefix = "refresh_token:"
+// codeRefreshRetry tells a client to try again with its latest token: another refresh
+// rotated first and nothing is wrong with the session. The status is 409 since many
+// clients read any 401 from the refresh endpoint as a sign-out.
+const codeRefreshRetry = "refresh_retry"
 
-// refreshKey scopes a refresh token to a single session (sub + jti) so that
-// logging in on a second device does not invalidate the first, and a single
-// session can be revoked independently of the rest.
-func refreshKey(sub, jti string) string {
-	return refreshTokenPrefix + sub + ":" + jti
-}
+// maxUserAgentLen bounds what is stored from a header the client fully controls.
+const maxUserAgentLen = 512
 
-// hashRefreshToken returns a hex SHA-256 of the refresh token. Only the hash is
-// stored server-side, so a Redis snapshot/dump never exposes usable bearer
-// tokens.
-func hashRefreshToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
+// errLostRotation rolls back a rotation that another request got to first.
+var errLostRotation = errors.New("auth: lost the rotation")
+
+// LoginContext is the client behind a request, stored on its session.
+type LoginContext struct {
+	UserAgent string
+	IP        string
 }
 
 // Service handles authentication business logic.
 type Service struct {
+	db          *gorm.DB
 	userRepo    repo.Repo[user.User]
+	sessionRepo repo.Repo[session.Session]
+	retiredRepo repo.Repo[session.RetiredRefreshToken]
 	issuer      platformauth.Issuer
-	verifier    platformauth.Verifier
 	redis       *goredis.Client
+	audit       *auditlog.Recorder
 	googleOAuth *oauth2.Config
-	jwtCfg      config.JWTConfig
+	// fetchGoogleUser is a field because the userinfo URL is Google's, not configurable.
+	fetchGoogleUser func(ctx context.Context, client *http.Client) (*googleUserInfo, error)
+	log             zerolog.Logger
+
+	resetRepo   repo.Repo[passwordreset.Token]
+	historyRepo repo.Repo[passwordhistory.Entry]
+	lockout     *lockout
+	mailer      email.Mailer
+	jobs        JobQueue
+
+	refreshTTL  time.Duration
+	absoluteTTL time.Duration
+	raceWindow  time.Duration
+
+	resetTTL      time.Duration
+	resetCooldown time.Duration
+	resetURL      string
+	historyCount  int
+
+	backupRepo     repo.Repo[mfa.BackupCode]
+	challengeRepo  repo.Repo[mfa.Challenge]
+	mfaKey         []byte // nil means MFA cannot be turned on
+	mfaIssuer      string
+	enrollTTL      time.Duration
+	challengeTTL   time.Duration
+	mfaMaxAttempts int
+	backupCount    int
 }
 
-func NewService(
-	userRepo repo.Repo[user.User],
-	issuer platformauth.Issuer,
-	verifier platformauth.Verifier,
-	redis *goredis.Client,
-	cfg config.Config,
-) *Service {
+// loadMFAKey returns nil unless a usable key is configured. Enrollment is then refused:
+// there is no plaintext fallback for a TOTP secret.
+func loadMFAKey(secret string, log zerolog.Logger) []byte {
+	if secret == "" {
+		log.Warn().Msg("auth: MFA_ENCRYPTION_KEY is not set; users cannot turn on two-factor authentication")
+		return nil
+	}
+	key, err := appcrypto.DeriveKey(secret)
+	if err != nil {
+		log.Error().Err(err).Msg("auth: MFA_ENCRYPTION_KEY is unusable; users cannot turn on two-factor authentication")
+		return nil
+	}
+	return key
+}
+
+// NewService builds the service. d.Redis may be nil: sessions live in Postgres, and
+// Redis only adds the access-token denylist.
+func NewService(d Deps) *Service {
 	var googleOAuth *oauth2.Config
-	if cfg.Google.ClientID != "" {
+	if d.Cfg.Google.ClientID != "" {
 		googleOAuth = &oauth2.Config{
-			ClientID:     cfg.Google.ClientID,
-			ClientSecret: cfg.Google.ClientSecret,
-			RedirectURL:  cfg.Google.RedirectURL,
+			ClientID:     d.Cfg.Google.ClientID,
+			ClientSecret: d.Cfg.Google.ClientSecret,
+			RedirectURL:  d.Cfg.Google.RedirectURL,
 			Scopes:       []string{"openid", "profile", "email"},
 			Endpoint:     google.Endpoint,
 		}
 	}
 
 	return &Service{
-		userRepo:    userRepo,
-		issuer:      issuer,
-		verifier:    verifier,
-		redis:       redis,
-		googleOAuth: googleOAuth,
-		jwtCfg:      cfg.JWT,
+		db:              d.DB,
+		userRepo:        repo.NewGormRepo[user.User](d.DB),
+		sessionRepo:     repo.NewGormRepo[session.Session](d.DB),
+		retiredRepo:     repo.NewGormRepo[session.RetiredRefreshToken](d.DB),
+		issuer:          d.Issuer,
+		redis:           d.Redis,
+		audit:           d.Audit,
+		googleOAuth:     googleOAuth,
+		fetchGoogleUser: fetchGoogleUserInfo,
+		log:             d.Log,
+		resetRepo:       repo.NewGormRepo[passwordreset.Token](d.DB),
+		historyRepo:     repo.NewGormRepo[passwordhistory.Entry](d.DB),
+		lockout: &lockout{
+			db:        d.DB,
+			threshold: d.Cfg.AuthSecurity.LockoutThreshold,
+			window:    d.Cfg.AuthSecurity.LockoutWindow,
+		},
+		mailer:        d.Mailer,
+		jobs:          d.Jobs,
+		refreshTTL:    d.Cfg.JWT.RefreshTokenExpiry,
+		absoluteTTL:   d.Cfg.AuthSecurity.SessionAbsoluteTTL,
+		raceWindow:    d.Cfg.AuthSecurity.RefreshRaceWindow,
+		resetTTL:      d.Cfg.AuthSecurity.PasswordResetTTL,
+		resetCooldown: d.Cfg.AuthSecurity.PasswordResetCooldown,
+		resetURL:      d.Cfg.AuthSecurity.PasswordResetURL,
+		historyCount:  d.Cfg.AuthSecurity.PasswordHistoryCount,
+
+		backupRepo:     repo.NewGormRepo[mfa.BackupCode](d.DB),
+		challengeRepo:  repo.NewGormRepo[mfa.Challenge](d.DB),
+		mfaKey:         loadMFAKey(d.Cfg.MFA.EncryptionKey, d.Log),
+		mfaIssuer:      d.Cfg.MFA.Issuer,
+		enrollTTL:      d.Cfg.MFA.EnrollTTL,
+		challengeTTL:   d.Cfg.MFA.ChallengeTTL,
+		mfaMaxAttempts: d.Cfg.MFA.MaxAttempts,
+		backupCount:    d.Cfg.MFA.BackupCodeCount,
 	}
 }
 
 // Register creates a new user with email/password credentials.
-func (s *Service) Register(ctx context.Context, req RegisterRequest) (*AuthResponse, error) {
+func (s *Service) Register(ctx context.Context, req RegisterRequest, lc LoginContext) (*AuthResponse, error) {
+	if platformauth.ValidatePassword(req.Password) != nil {
+		return nil, weakPasswordError(req.Password)
+	}
+
 	exists, err := s.userRepo.Exists(ctx, store.QueryOpts{
 		Filters: map[string]any{"email": req.Email},
 	})
@@ -111,105 +189,272 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*AuthRespo
 		return nil, apierr.Internal("failed to create user")
 	}
 
-	return s.issueTokenPair(ctx, u)
+	return s.issueSession(ctx, u, session.MethodPassword, lc)
 }
 
-// Login authenticates via email/password and returns a token pair.
-func (s *Service) Login(ctx context.Context, req LoginRequest) (*AuthResponse, error) {
+// Login authenticates via email/password. It starts a session, or, on an account with MFA
+// on, returns the challenge that must be passed first.
+func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) (*AuthResponse, *MFAChallengeResponse, error) {
+	remaining, err := s.lockout.reserve(ctx, req.Email)
+	if err != nil {
+		return nil, nil, apierr.InternalErr(err, "lockout check failed")
+	}
+	if remaining > 0 {
+		s.record(ctx, audit.EventLoginLocked, nil, lc.IP, nil)
+		return nil, nil, lockedError(remaining)
+	}
+
 	u, err := s.userRepo.GetOne(ctx, store.QueryOpts{
 		Filters: map[string]any{"email": req.Email},
 	})
 	if err != nil {
-		return nil, apierr.Unauthorized("invalid credentials")
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, apierr.InternalErr(err, "login lookup failed")
+		}
+		// The address stays out of the row: people type passwords into the wrong field.
+		s.record(ctx, audit.EventLoginFailure, nil, lc.IP, nil)
+		return nil, nil, apierr.Unauthorized("invalid credentials")
 	}
 
 	if u.PasswordHash == "" {
-		return nil, apierr.BadRequest("oauth_only", "this account uses Google sign-in")
+		s.releaseAttempt(ctx, req.Email)
+		return nil, nil, apierr.BadRequest("oauth_only", "this account uses Google sign-in")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
-		return nil, apierr.Unauthorized("invalid credentials")
+		s.record(ctx, audit.EventLoginFailure, &u.ID, lc.IP, nil)
+		return nil, nil, apierr.Unauthorized("invalid credentials")
 	}
 
-	return s.issueTokenPair(ctx, u)
+	// Earlier failures stay counted until the second factor passes. Otherwise someone
+	// holding the password could reset the count by signing in again, and guess codes
+	// without limit.
+	if u.MFAEnrolledAt != nil {
+		s.releaseAttempt(ctx, req.Email)
+		challenge, err := s.startChallenge(ctx, u, session.MethodPassword)
+		return nil, challenge, err
+	}
+
+	s.clearAttempts(ctx, req.Email)
+	resp, err := s.issueSession(ctx, u, session.MethodPassword, lc)
+	return resp, nil, err
 }
 
-// RefreshTokens exchanges a valid refresh token for a new token pair.
-func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*AuthResponse, error) {
-	claims, err := s.verifier.Verify(refreshToken)
+// issueSession creates a session and the token pair for it.
+func (s *Service) issueSession(ctx context.Context, u *user.User, method session.LoginMethod, lc LoginContext) (*AuthResponse, error) {
+	refresh, err := platformauth.GenerateOpaqueToken()
 	if err != nil {
-		return nil, apierr.Unauthorized("invalid or expired refresh token")
+		return nil, apierr.InternalErr(err, "failed to generate refresh token")
 	}
 
-	// Reject access tokens (or anything that isn't a refresh token) presented here.
-	if claims.TokenUse != platformauth.UseRefresh {
-		return nil, apierr.Unauthorized("invalid or expired refresh token")
+	now := time.Now().UTC()
+	absolute := now.Add(s.absoluteTTL)
+	sess := &session.Session{
+		UUID:             uuid.New(),
+		UserID:           u.ID,
+		RefreshTokenHash: platformauth.HashToken(refresh),
+		LoginMethod:      method,
+		UserAgent:        lc.UserAgent,
+		IP:               lc.IP,
+		LastUsedAt:       now,
+		ExpiresAt:        earliest(now.Add(s.refreshTTL), absolute),
+		AbsoluteExpiry:   absolute,
+	}
+	if err := s.sessionRepo.Create(ctx, sess); err != nil {
+		return nil, apierr.InternalErr(err, "failed to create session")
 	}
 
-	key := refreshKey(claims.Subject, claims.JTI)
-
-	// Atomically fetch-and-delete the stored hash. GETDEL makes rotation
-	// race-free: of two concurrent refreshes for the same token, only one sees
-	// the value — the other gets redis.Nil and is rejected, so a single refresh
-	// token can never mint two live sessions.
-	stored, err := s.redis.GetDel(ctx, key).Result()
+	access, err := s.issuer.IssueAccessToken(platformauth.AccessParams{Subject: u.UUID.String(), SID: sess.UUID.String()})
 	if err != nil {
-		return nil, apierr.Unauthorized("refresh token not recognised")
-	}
-	// Constant-time compare against the presented token's hash.
-	if subtle.ConstantTimeCompare([]byte(stored), []byte(hashRefreshToken(refreshToken))) != 1 {
-		return nil, apierr.Unauthorized("refresh token not recognised")
+		return nil, apierr.InternalErr(err, "failed to issue access token")
 	}
 
-	userUUID, err := uuid.Parse(claims.Subject)
-	if err != nil {
-		return nil, apierr.Unauthorized("invalid token subject")
-	}
-
-	u, err := s.userRepo.GetByUUID(ctx, userUUID)
-	if err != nil {
-		return nil, apierr.Unauthorized("user not found")
-	}
-
-	return s.issueTokenPair(ctx, u)
+	s.record(ctx, audit.EventLoginSuccess, &u.ID, lc.IP, map[string]any{"method": string(method), "session": sess.UUID.String()})
+	return authResponse(u, access.Token, refresh), nil
 }
 
-// Logout revokes the current session: it denylists the presented access token
-// (by jti, until it would have expired) and deletes the refresh session so it
-// can no longer be exchanged. The optional refresh token must belong to the
-// same subject as the access token — a user cannot revoke someone else's session.
-func (s *Service) Logout(ctx context.Context, accessClaims *platformauth.Claims, refreshToken string) error {
-	if accessClaims == nil {
+// RefreshTokens rotates the session a refresh token belongs to and returns new tokens.
+//
+// Expect concurrent calls as a matter of routine. A page loading several resources just
+// after its access token lapses fires several refreshes carrying one token. Only one of
+// them rotates; the rest get a refusal they can retry, and the session stays valid.
+func (s *Service) RefreshTokens(ctx context.Context, refreshToken string, lc LoginContext) (*AuthResponse, error) {
+	hash := platformauth.HashToken(refreshToken)
+	now := time.Now().UTC()
+
+	sess, err := s.sessionRepo.GetOne(ctx, store.QueryOpts{Filters: map[string]any{"refresh_token_hash": hash}})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, s.judgeRetiredToken(ctx, hash, lc)
+	}
+	if err != nil {
+		return nil, apierr.InternalErr(err, "refresh lookup failed")
+	}
+
+	if err := s.checkRefreshable(ctx, sess, now); err != nil {
+		return nil, err
+	}
+	u, err := s.userRepo.GetByID(ctx, sess.UserID)
+	if err != nil {
+		return nil, apierr.UnauthorizedCode("session_expired", "user not found")
+	}
+
+	newRefresh, err := platformauth.GenerateOpaqueToken()
+	if err != nil {
+		return nil, apierr.InternalErr(err, "failed to generate refresh token")
+	}
+	// Minted before the rotation, so a failure here leaves the client's token valid.
+	access, err := s.issuer.IssueAccessToken(platformauth.AccessParams{Subject: u.UUID.String(), SID: sess.UUID.String()})
+	if err != nil {
+		return nil, apierr.InternalErr(err, "failed to issue access token")
+	}
+
+	// The update only applies if the session still has the hash read above, so when two
+	// requests race with one token a single one writes, and no client is handed a token that
+	// matches no row. Requiring revoked_at to be empty keeps a rotation from succeeding after
+	// a concurrent sign-out. The retired hash is written in the same transaction, which means
+	// a token cannot leave the session without also becoming recognizable as retired.
+	err = store.WithTx(ctx, s.db, func(ctx context.Context, _ *gorm.DB) error {
+		rotated, err := s.sessionRepo.UpdateColumnsGuarded(ctx, sess.ID,
+			map[string]any{"refresh_token_hash": hash, "revoked_at": nil},
+			nil,
+			map[string]any{
+				"refresh_token_hash":      platformauth.HashToken(newRefresh),
+				"prev_refresh_token_hash": hash,
+				"rotated_at":              now,
+				"last_used_at":            now,
+				"expires_at":              earliest(now.Add(s.refreshTTL), sess.AbsoluteExpiry),
+			})
+		if err != nil {
+			return err
+		}
+		if !rotated {
+			return errLostRotation
+		}
+		return s.retiredRepo.Create(ctx, &session.RetiredRefreshToken{SessionID: sess.ID, TokenHash: hash, RetiredAt: now})
+	})
+	if errors.Is(err, errLostRotation) {
+		return nil, s.raceRefusal(ctx, sess, lc)
+	}
+	if err != nil {
+		return nil, apierr.InternalErr(err, "failed to rotate session")
+	}
+
+	s.record(ctx, audit.EventTokenRefresh, &u.ID, lc.IP, map[string]any{"session": sess.UUID.String()})
+	return authResponse(u, access.Token, newRefresh), nil
+}
+
+// judgeRetiredToken handles a hash that matches no session's current token, and every
+// path through it ends in an error.
+//
+// An unknown hash is a plain refusal. A known retired hash revokes its session unless it
+// belongs to the immediately previous generation and that rotation is inside the race
+// window, in which case the caller merely lost to a concurrent refresh. Older generations
+// never qualify. Two rotations have passed since such a token was live, and if the
+// presenter did not perform them then somebody else did, which is what theft looks like
+// when the real owner returns after the attacker has already rotated.
+func (s *Service) judgeRetiredToken(ctx context.Context, hash string, lc LoginContext) error {
+	retired, err := s.retiredRepo.GetOne(ctx, store.QueryOpts{Filters: map[string]any{"token_hash": hash}})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return apierr.UnauthorizedCode("session_expired", "invalid refresh token")
+	}
+	if err != nil {
+		return apierr.InternalErr(err, "refresh lookup failed")
+	}
+	reused, err := s.sessionRepo.GetByID(ctx, retired.SessionID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return apierr.UnauthorizedCode("session_expired", "invalid refresh token")
+	}
+	if err != nil {
+		return apierr.InternalErr(err, "refresh lookup failed")
+	}
+	if reused.RevokedAt != nil {
+		return apierr.UnauthorizedCode("session_expired", "session revoked")
+	}
+	previousGeneration := reused.PrevRefreshTokenHash == hash
+	if previousGeneration && reused.RotatedAt != nil && time.Since(*reused.RotatedAt) <= s.raceWindow {
+		return s.raceRefusal(ctx, reused, lc)
+	}
+
+	if err := s.revokeSession(ctx, reused); err != nil {
+		return err
+	}
+	s.record(ctx, audit.EventRefreshReuse, &reused.UserID, lc.IP, map[string]any{"session": reused.UUID.String()})
+	return apierr.UnauthorizedCode("session_expired", "refresh token reuse detected")
+}
+
+func (s *Service) raceRefusal(ctx context.Context, sess *session.Session, lc LoginContext) error {
+	s.record(ctx, audit.EventRefreshRace, &sess.UserID, lc.IP, map[string]any{"session": sess.UUID.String()})
+	return apierr.Conflict(codeRefreshRetry, "refresh token already rotated; retry with the latest token")
+}
+
+// checkRefreshable refuses a session that is impersonated, revoked or past either expiry.
+func (s *Service) checkRefreshable(ctx context.Context, sess *session.Session, now time.Time) error {
+	// An impersonated session is created with a hash nobody can redeem, so getting this far
+	// signals a fault. It is revoked and refused, which keeps the session's TTL final.
+	if sess.ImpersonatorUserID != nil {
+		if err := s.revokeSession(ctx, sess); err != nil {
+			return err
+		}
+		return apierr.UnauthorizedCode("session_expired", "impersonation sessions cannot be refreshed")
+	}
+	if sess.RevokedAt != nil {
+		return apierr.UnauthorizedCode("session_expired", "session revoked")
+	}
+	if now.After(sess.AbsoluteExpiry) || now.After(sess.ExpiresAt) {
+		return apierr.UnauthorizedCode("session_expired", "session expired; please sign in again")
+	}
+	return nil
+}
+
+// Logout revokes the current session and denylists the presented access token. An
+// optional refresh token must belong to the same user: nobody can sign out someone else.
+func (s *Service) Logout(ctx context.Context, userID uint, claims *platformauth.Claims, refreshToken, ip string) error {
+	if claims == nil {
 		return apierr.Unauthorized("missing authentication")
 	}
 
-	// Revoke the access token. This is a guarantee, not best-effort: if the
-	// denylist write fails, logout fails so the caller knows the token is still
-	// live.
-	if accessClaims.JTI != "" {
-		ttl := time.Until(accessClaims.ExpiresAt)
-		if ttl > 0 {
-			if err := s.redis.Set(ctx, platformauth.DenylistKey(accessClaims.JTI), "1", ttl).Err(); err != nil {
-				return apierr.Internal("failed to revoke access token")
-			}
-		}
-	}
-
+	var other *session.Session
 	if refreshToken != "" {
-		rc, err := s.verifier.Verify(refreshToken)
-		// Ignore a malformed/expired refresh token — access revocation already
-		// happened. But a *valid* token for another subject is an attempt to
-		// revoke a session that isn't the caller's: reject it.
-		if err == nil && rc.TokenUse == platformauth.UseRefresh {
-			if rc.Subject != accessClaims.Subject {
+		found, err := s.sessionRepo.GetOne(ctx, store.QueryOpts{
+			Filters: map[string]any{"refresh_token_hash": platformauth.HashToken(refreshToken)},
+		})
+		switch {
+		case err == nil:
+			if found.UserID != userID {
 				return apierr.Forbidden("refresh token does not belong to the authenticated user")
 			}
-			if err := s.redis.Del(ctx, refreshKey(rc.Subject, rc.JTI)).Err(); err != nil {
-				return apierr.Internal("failed to revoke refresh session")
+			other = found
+		case !errors.Is(err, gorm.ErrRecordNotFound):
+			return apierr.InternalErr(err, "session lookup failed")
+		}
+	}
+
+	current, err := s.sessionByUUID(ctx, claims.SID)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return apierr.InternalErr(err, "session lookup failed")
+	}
+	if err == nil {
+		if err := s.revokeSession(ctx, current); err != nil {
+			return err
+		}
+	}
+	if other != nil {
+		if err := s.revokeSession(ctx, other); err != nil {
+			return err
+		}
+	}
+
+	// The session row is what makes the token dead, so a denylist failure is not a failed
+	// logout. The denylist still spares a database read on the token's next use.
+	if s.redis != nil && claims.JTI != "" {
+		if ttl := time.Until(claims.ExpiresAt); ttl > 0 {
+			if err := s.redis.Set(ctx, platformauth.DenylistKey(claims.JTI), "1", ttl).Err(); err != nil {
+				s.log.Warn().Err(err).Msg("auth: failed to denylist access token after revoking its session")
 			}
 		}
 	}
 
+	s.record(ctx, audit.EventLogout, &userID, ip, map[string]any{"session": claims.SID})
 	return nil
 }
 
@@ -221,99 +466,119 @@ func (s *Service) GoogleAuthURL(state string) (string, error) {
 	return s.googleOAuth.AuthCodeURL(state, oauth2.AccessTypeOffline), nil
 }
 
-// GoogleCallback exchanges an auth code for user info and upserts the user.
-func (s *Service) GoogleCallback(ctx context.Context, code string) (*AuthResponse, error) {
+// GoogleCallback exchanges an auth code for user info and upserts the user. Google is the
+// first factor only: an account with MFA on still gets a challenge, or turning MFA on would
+// protect nothing against a compromised Google account.
+func (s *Service) GoogleCallback(ctx context.Context, code string, lc LoginContext) (*AuthResponse, *MFAChallengeResponse, error) {
 	if s.googleOAuth == nil {
-		return nil, apierr.Internal("google oauth not configured")
+		return nil, nil, apierr.Internal("google oauth not configured")
 	}
 
 	token, err := s.googleOAuth.Exchange(ctx, code)
 	if err != nil {
-		return nil, apierr.BadRequest("google_exchange_failed", "could not exchange code")
+		return nil, nil, apierr.BadRequest("google_exchange_failed", "could not exchange code")
 	}
 
-	info, err := fetchGoogleUserInfo(ctx, s.googleOAuth.Client(ctx, token))
+	info, err := s.fetchGoogleUser(ctx, s.googleOAuth.Client(ctx, token))
 	if err != nil {
-		return nil, apierr.Internal("could not fetch google user info")
+		return nil, nil, apierr.Internal("could not fetch google user info")
 	}
 
+	u, err := s.upsertGoogleUser(ctx, info)
+	if err != nil {
+		return nil, nil, err
+	}
+	if u.MFAEnrolledAt != nil {
+		challenge, err := s.startChallenge(ctx, u, session.MethodGoogle)
+		return nil, challenge, err
+	}
+	resp, err := s.issueSession(ctx, u, session.MethodGoogle, lc)
+	return resp, nil, err
+}
+
+func (s *Service) upsertGoogleUser(ctx context.Context, info *googleUserInfo) (*user.User, error) {
 	u, err := s.userRepo.GetOne(ctx, store.QueryOpts{
 		Filters: map[string]any{"google_id": info.ID},
 	})
+	if err == nil {
+		return u, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, apierr.Internal("db lookup failed")
+	}
 
+	u, err = s.userRepo.GetOne(ctx, store.QueryOpts{
+		Filters: map[string]any{"email": info.Email},
+	})
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, apierr.Internal("db lookup failed")
 	}
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		u, err = s.userRepo.GetOne(ctx, store.QueryOpts{
-			Filters: map[string]any{"email": info.Email},
-		})
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, apierr.Internal("db lookup failed")
+		u = &user.User{
+			UUID:         uuid.New(),
+			Email:        info.Email,
+			Name:         info.Name,
+			GoogleID:     info.ID,
+			AvatarURL:    info.Picture,
+			PlatformRole: entities.RoleUser,
 		}
-
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			u = &user.User{
-				UUID:         uuid.New(),
-				Email:        info.Email,
-				Name:         info.Name,
-				GoogleID:     info.ID,
-				AvatarURL:    info.Picture,
-				PlatformRole: entities.RoleUser,
-			}
-			if err := s.userRepo.Create(ctx, u); err != nil {
-				return nil, apierr.Internal("failed to create user")
-			}
-		} else {
-			if err := s.userRepo.UpdateColumnsByID(ctx, u.ID, map[string]any{
-				"google_id":  info.ID,
-				"avatar_url": info.Picture,
-			}); err != nil {
-				return nil, apierr.Internal("failed to link google account")
-			}
-			u.GoogleID = info.ID
-			u.AvatarURL = info.Picture
+		if err := s.userRepo.Create(ctx, u); err != nil {
+			return nil, apierr.Internal("failed to create user")
 		}
+		return u, nil
 	}
 
-	return s.issueTokenPair(ctx, u)
+	if err := s.userRepo.UpdateColumnsByID(ctx, u.ID, map[string]any{
+		"google_id":  info.ID,
+		"avatar_url": info.Picture,
+	}); err != nil {
+		return nil, apierr.Internal("failed to link google account")
+	}
+	u.GoogleID = info.ID
+	u.AvatarURL = info.Picture
+	return u, nil
 }
 
-func (s *Service) issueTokenPair(ctx context.Context, u *user.User) (*AuthResponse, error) {
-	uuidStr := u.UUID.String()
-
-	access, err := s.issuer.IssueAccessToken(uuidStr)
-	if err != nil {
-		return nil, apierr.Internal("failed to issue access token")
-	}
-
-	refresh, err := s.issuer.IssueRefreshToken(uuidStr)
-	if err != nil {
-		return nil, apierr.Internal("failed to issue refresh token")
-	}
-
-	// Store only the hash of the refresh token under a per-session key so
-	// concurrent sessions (multiple devices) coexist and can be revoked
-	// individually, and a Redis dump never leaks usable tokens.
-	key := refreshKey(uuidStr, refresh.JTI)
-	if err := s.redis.Set(ctx, key, hashRefreshToken(refresh.Token), s.jwtCfg.RefreshTokenExpiry).Err(); err != nil {
-		return nil, apierr.Internal("failed to store refresh token")
-	}
-
+func authResponse(u *user.User, access, refresh string) *AuthResponse {
 	return &AuthResponse{
 		User: UserResponse{
-			UUID:         uuidStr,
+			UUID:         u.UUID.String(),
 			Name:         u.Name,
 			Email:        u.Email,
 			AvatarURL:    u.AvatarURL,
 			PlatformRole: string(u.PlatformRole),
 		},
-		Tokens: TokenPairResponse{
-			AccessToken:  access.Token,
-			RefreshToken: refresh.Token,
-		},
-	}, nil
+		Tokens: TokenPairResponse{AccessToken: access, RefreshToken: refresh},
+	}
+}
+
+func earliest(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+// record writes an audit row where losing it must not fail the caller, such as a login.
+// The recorder has already logged the failure.
+func (s *Service) record(ctx context.Context, event string, actor *uint, ip string, detail map[string]any) {
+	if s.audit == nil {
+		return
+	}
+	_ = s.audit.Record(ctx, auditlog.Entry{Event: event, ActorUserID: actor, IP: ip, Detail: detail})
+}
+
+// recordRequired writes an audit row inside a transaction, where its failure must undo
+// the change: a privileged action with no record is worse than one that did not happen.
+func (s *Service) recordRequired(ctx context.Context, e auditlog.Entry) error {
+	if s.audit == nil {
+		return nil
+	}
+	if err := s.audit.Record(ctx, e); err != nil {
+		return apierr.InternalErr(err, "failed to record audit event")
+	}
+	return nil
 }
 
 type googleUserInfo struct {

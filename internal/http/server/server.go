@@ -5,11 +5,15 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/adminaudit"
 	apiauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/example"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/users"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware/ratelimit"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	pdb "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/db"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/metrics"
@@ -43,6 +47,7 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 		middleware.Logger(deps.Log),
 		middleware.SecurityHeaders(),
 		middleware.BodyLimit(deps.Cfg.MaxRequestBodyBytes),
+		middleware.RejectNULBytes(),
 		metrics.Middleware(),
 	)
 
@@ -106,9 +111,10 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 		deps.Cfg.JWT.TokenIssuer,
 		deps.Cfg.JWT.TokenAudience,
 		deps.Cfg.JWT.TokenExpiration,
-		deps.Cfg.JWT.RefreshTokenExpiry,
 	)
 	userRepo := repo.NewGormRepo[user.User](deps.DB)
+	sessionRepo := repo.NewGormRepo[session.Session](deps.DB)
+	recorder := auditlog.NewGormRecorder(deps.DB, deps.Log)
 
 	v1 := r.Group("/v1")
 
@@ -127,30 +133,41 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 	// is keyed by user id (not the shared NAT/proxy IP).
 	failOpen := deps.Cfg.AuthRevocationFailOpen
 	secured := v1.Group("")
-	secured.Use(middleware.UserAuth(jwtVerifier, userRepo, rawRedis, failOpen))
+	secured.Use(middleware.UserAuth(jwtVerifier, userRepo, sessionRepo, rawRedis, failOpen))
 	if rl != nil {
 		secured.Use(rl.Global())
 	}
 
-	// Auth routes: public endpoints get the strict Auth bucket (IP-keyed);
-	// logout is registered on the authenticated group.
-	if deps.Redis != nil {
-		var authLimit gin.HandlerFunc
-		if rl != nil {
-			authLimit = rl.Auth()
-		}
-		apiauth.RegisterRoutes(v1, secured, deps.Cfg, userRepo, jwtIssuer, jwtVerifier, rawRedis, authLimit)
-	}
-
-	example.RegisterRoutes(secured, deps.DB)
-
 	// Admin routes: AdminAuth first (sets identity), then the admin bucket so it
 	// is user-keyed.
 	admin := v1.Group("/admin")
-	admin.Use(middleware.AdminAuth(jwtVerifier, userRepo, rawRedis, failOpen))
+	admin.Use(middleware.AdminAuth(jwtVerifier, userRepo, sessionRepo, rawRedis, failOpen))
 	if rl != nil {
 		admin.Use(rl.Admin())
 	}
+	adminaudit.RegisterRoutes(admin, deps.DB)
+	users.RegisterRoutes(admin, deps.DB, recorder)
+
+	// Auth routes: public endpoints get the strict Auth bucket (IP-keyed) when
+	// Redis exists; the rest are registered on the authenticated group. Sessions
+	// live in Postgres, so these do not depend on Redis being enabled.
+	var authLimit gin.HandlerFunc
+	if rl != nil {
+		authLimit = rl.Auth()
+	}
+	apiauth.RegisterRoutes(v1, secured, admin, apiauth.Deps{
+		Cfg:       deps.Cfg,
+		DB:        deps.DB,
+		Issuer:    jwtIssuer,
+		Redis:     rawRedis,
+		Audit:     recorder,
+		Log:       deps.Log,
+		Mailer:    deps.Mailer,
+		Jobs:      deps.Worker,
+		AuthLimit: authLimit,
+	})
+
+	example.RegisterRoutes(secured, deps.DB)
 
 	return r, nil
 }
