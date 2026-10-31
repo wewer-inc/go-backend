@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,7 +50,7 @@ func TestAuthRoutesAreRegisteredWithoutRedis(t *testing.T) {
 		{http.MethodGet, "/v1/admin/audit", http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
-		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{"))
+		req := httptest.NewRequestWithContext(context.Background(), tc.method, tc.path, strings.NewReader("{"))
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 		if w.Code != tc.want {

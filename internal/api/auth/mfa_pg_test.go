@@ -160,6 +160,8 @@ func TestParallelBadCodesStayWithinTheThresholdOnPostgres(t *testing.T) {
 func TestParallelSignInsLeaveOneLiveChallengeOnPostgres(t *testing.T) {
 	e := newPGEnv(t)
 	u, _, _ := e.enrolledUser(t, entities.RoleUser)
+	// Ten parallel sign-ins would overrun the lockout, which is not what this test is about.
+	e.deps.Cfg.AuthSecurity.LockoutThreshold = 0
 	svc := NewService(e.deps)
 
 	var wg sync.WaitGroup
@@ -180,6 +182,30 @@ func TestParallelSignInsLeaveOneLiveChallengeOnPostgres(t *testing.T) {
 	}
 	if live != 1 {
 		t.Fatalf("%d live challenges", live)
+	}
+}
+
+// Parallel requests with the right password may be turned away while they overlap, but
+// must not leave the account locked once they finish.
+func TestBurstOfCorrectPasswordsLeavesNoLockoutOnPostgres(t *testing.T) {
+	e := newPGEnv(t)
+	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			e.loginWith(t, u.Email, testPassword)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if w := e.verifyMFA(t, e.challenge(t, u), e.code(t, secret)); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 }
 

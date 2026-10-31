@@ -71,6 +71,14 @@ func (l *lockout) reserve(ctx context.Context, email string) (time.Duration, err
 		return 0, nil
 	}
 
+	// A refused attempt checked nothing, so it is given back. Without this, a burst of
+	// parallel requests with the right password could overrun the threshold while their
+	// reservations were in flight, and the refused ones would stay counted and lock out a
+	// legitimate user. Bad guesses stay bounded: each one that was checked holds its slot.
+	if err := l.release(ctx, email); err != nil {
+		return 0, err
+	}
+
 	var f loginfailure.Failure
 	err := conn.Where("key_hash = ?", key).Take(&f).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {

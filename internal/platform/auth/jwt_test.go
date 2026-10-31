@@ -102,7 +102,8 @@ func TestOpaqueTokensAreRandomAndHashStably(t *testing.T) {
 	if a == b || len(a) < 40 {
 		t.Fatalf("tokens: %q %q", a, b)
 	}
-	if HashToken(a) != HashToken(a) || HashToken(a) == HashToken(b) || HashToken(a) == a {
+	first, second := HashToken(a), HashToken(a)
+	if first != second || first == HashToken(b) || first == a {
 		t.Fatal("hash is not a stable one-way function of the token")
 	}
 }

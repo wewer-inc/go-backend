@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -623,8 +624,8 @@ func TestRefreshLookupFailureIsNotASignOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := NewService(e.deps).RefreshTokens(context.Background(), tokens.RefreshToken, LoginContext{})
-	apiErr, ok := err.(*apierr.APIError)
-	if !ok || apiErr.Status != http.StatusInternalServerError {
+	var apiErr *apierr.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
 		t.Fatalf("err = %v", err)
 	}
 }

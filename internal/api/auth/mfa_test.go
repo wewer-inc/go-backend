@@ -520,6 +520,40 @@ func TestParallelBadPasswordsStayWithinTheThreshold(t *testing.T) {
 	}
 }
 
+func TestBurstOfCorrectPasswordsLeavesNoLockout(t *testing.T) {
+	e := newEnv(t)
+	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.loginWith(t, u.Email, testPassword)
+		}()
+	}
+	wg.Wait()
+	if w := e.verifyMFA(t, e.challenge(t, u), e.code(t, secret)); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
+// Refused attempts give their slot back, and that must not reopen the door: once the
+// threshold's worth of guesses have failed, every further one is refused unchecked.
+func TestRefusedAttemptsDoNotReopenTheLock(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	for i := 0; i < testLockoutThreshold; i++ {
+		if w := e.loginWith(t, u.Email, "not-the-password"); w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: %d", i, w.Code)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		if w := e.loginWith(t, u.Email, testPassword); w.Code != http.StatusTooManyRequests {
+			t.Fatalf("refusal %d: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+}
+
 // A good password gives its attempt back, so signing in does not itself burn the count.
 func TestCorrectPasswordDoesNotCountAgainstAnEnrolledUser(t *testing.T) {
 	e := newEnv(t)

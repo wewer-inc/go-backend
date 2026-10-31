@@ -119,7 +119,7 @@ func (e *env) patch(t *testing.T, access, target, role string) *httptest.Respons
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPatch, "/v1/admin/users/"+target+"/role", strings.NewReader(string(body)))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPatch, "/v1/admin/users/"+target+"/role", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	if access != "" {
 		req.Header.Set("Authorization", "Bearer "+access)
@@ -131,7 +131,7 @@ func (e *env) patch(t *testing.T, access, target, role string) *httptest.Respons
 
 func (e *env) stillSignedIn(t *testing.T, access string) bool {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/v1/ping", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/ping", nil)
 	req.Header.Set("Authorization", "Bearer "+access)
 	w := httptest.NewRecorder()
 	e.router.ServeHTTP(w, req)

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -89,7 +90,7 @@ func (e *authEnv) tokenFor(t *testing.T, u *user.User, sid string) string {
 }
 
 func call(r http.Handler, token string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

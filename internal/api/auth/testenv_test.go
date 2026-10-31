@@ -206,7 +206,7 @@ func (e *testEnv) addUser(t *testing.T, role entities.Role) *user.User {
 }
 
 func (e *testEnv) request(method, path, token, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "test-agent")
 	if token != "" {

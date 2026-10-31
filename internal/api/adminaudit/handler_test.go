@@ -55,7 +55,7 @@ func setup(t *testing.T, s authz.Subject) (*gin.Engine, *gorm.DB) {
 
 func get(r http.Handler, path string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	r.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
 	return w
 }
 
