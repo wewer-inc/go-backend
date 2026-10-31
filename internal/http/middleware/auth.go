@@ -32,30 +32,47 @@ func UserAuth(
 	redis *goredis.Client,
 	revocationFailOpen bool,
 ) gin.HandlerFunc {
+	authenticate := authenticator(verifier, userRepo, redis, revocationFailOpen)
 	return func(c *gin.Context) {
+		if authenticate(c) {
+			c.Next()
+		}
+	}
+}
+
+// authenticator verifies the request and sets the actor on the context. It reports
+// whether the request may proceed, having already answered when it may not. It never
+// calls c.Next, so a caller can add its own check before the rest of the chain runs.
+func authenticator(
+	verifier auth.Verifier,
+	userRepo repo.Repo[user.User],
+	redis *goredis.Client,
+	revocationFailOpen bool,
+) func(c *gin.Context) bool {
+	return func(c *gin.Context) bool {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			unauthorized(c, "unauthorized")
-			return
+			return false
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			unauthorized(c, "unauthorized")
-			return
+			return false
 		}
 
 		claims, err := verifier.Verify(parts[1])
 		if err != nil {
 			unauthorized(c, "invalid or expired token")
-			return
+			return false
 		}
 
 		// Reject refresh tokens (or anything not minted as an access token)
 		// presented as a bearer credential.
 		if claims.TokenUse != auth.UseAccess {
 			unauthorized(c, "invalid or expired token")
-			return
+			return false
 		}
 
 		// Revocation check: a logged-out access token is denylisted by jti.
@@ -66,23 +83,23 @@ func UserAuth(
 				// Fail closed: cannot prove the token is still valid.
 				c.JSON(http.StatusServiceUnavailable, apicommon.Response[any]{Error: "auth_unavailable", Message: "revocation store unavailable"})
 				c.Abort()
-				return
+				return false
 			case err == nil && n > 0:
 				unauthorized(c, "token revoked")
-				return
+				return false
 			}
 		}
 
 		userUUID, err := uuid.Parse(claims.Subject)
 		if err != nil {
 			unauthorized(c, "invalid token subject")
-			return
+			return false
 		}
 
 		u, err := userRepo.GetByUUID(c.Request.Context(), userUUID)
 		if err != nil {
 			unauthorized(c, "user not found")
-			return
+			return false
 		}
 
 		c.Set(ctxActorUserID, u.ID)
@@ -93,22 +110,22 @@ func UserAuth(
 		// effect on the next request rather than when the token expires.
 		c.Set(ctxActorSubject, authz.Subject{UserID: u.ID, Role: u.PlatformRole})
 
-		c.Next()
+		return true
 	}
 }
 
-// AdminAuth wraps UserAuth and additionally enforces admin role.
+// AdminAuth authenticates like UserAuth and additionally enforces admin role, before
+// anything downstream runs.
 func AdminAuth(
 	verifier auth.Verifier,
 	userRepo repo.Repo[user.User],
 	redis *goredis.Client,
 	revocationFailOpen bool,
 ) gin.HandlerFunc {
-	userAuth := UserAuth(verifier, userRepo, redis, revocationFailOpen)
+	authenticate := authenticator(verifier, userRepo, redis, revocationFailOpen)
 
 	return func(c *gin.Context) {
-		userAuth(c)
-		if c.IsAborted() {
+		if !authenticate(c) {
 			return
 		}
 

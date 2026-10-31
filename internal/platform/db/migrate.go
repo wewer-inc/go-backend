@@ -1,6 +1,7 @@
 package db
 
 import (
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/note"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/go-gormigrate/gormigrate/v2"
@@ -42,6 +43,15 @@ func migrations() []*gormigrate.Migration {
 			},
 			Rollback: func(tx *gorm.DB) error {
 				return tx.Migrator().DropTable(&note.Note{})
+			},
+		},
+		{
+			ID: "0003_audit_logs",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.AutoMigrate(&audit.Log{})
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return tx.Migrator().DropTable(&audit.Log{})
 			},
 		},
 	}

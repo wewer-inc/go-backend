@@ -159,6 +159,15 @@ All auth responses return:
 
 Pass `Authorization: Bearer <access_token>` on secured routes.
 
+## Admin endpoints
+
+| Method | Path                   | Gate                        |
+| ------ | ---------------------- | --------------------------- |
+| GET    | `/v1/admin/audit`      | permission `admin.audit:read` |
+| GET    | `/v1/admin/audit/verify` | permission `admin.audit:read` |
+
+The audit trail is a hash chain (`internal/platform/auditlog`). On its own it cannot detect tail truncation: deleting the newest rows, or all of them, leaves a valid shorter chain, and the hash is unkeyed, so someone able to rewrite the table can recompute it. To detect those, store `head_id` and `head` from `/verify` somewhere the database's writers cannot modify, and pass them back as `?checkpoint_id=&checkpoint_hash=`. Nothing here exports them for you.
+
 ---
 
 ## Observability

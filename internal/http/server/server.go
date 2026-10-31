@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/adminaudit"
 	apiauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/example"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
@@ -152,6 +153,7 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 	if rl != nil {
 		admin.Use(rl.Admin())
 	}
+	adminaudit.RegisterRoutes(admin, deps.DB)
 
 	return r, nil
 }
