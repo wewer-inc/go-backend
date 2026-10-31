@@ -189,6 +189,9 @@ On an account with two-factor authentication on, `login` and the Google callback
 | GET    | `/v1/admin/audit/verify` | permission `admin.audit:read` |
 | POST   | `/v1/admin/users/:uuid/mfa/reset` | capability `admin.users.mfa:reset`, plus the admin's own TOTP code |
 | POST   | `/v1/admin/users/:uuid/impersonate` | capability `admin.users:impersonate` |
+| PATCH  | `/v1/admin/users/:uuid/role` | capability `admin.users.role:update` |
+
+A role change signs the target out everywhere and is audited. The last admin cannot be demoted.
 
 "Login as" issues a five-minute access token with no refresh token. It cannot nest, cannot target an admin or yourself, and cannot change the account's password, MFA or other sessions. Every audit row written inside it names the impersonator, and the user's session list labels it.
 

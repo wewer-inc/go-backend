@@ -8,6 +8,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/adminaudit"
 	apiauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/example"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/users"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
@@ -145,6 +146,7 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 		admin.Use(rl.Admin())
 	}
 	adminaudit.RegisterRoutes(admin, deps.DB)
+	users.RegisterRoutes(admin, deps.DB, recorder)
 
 	// Auth routes: public endpoints get the strict Auth bucket (IP-keyed) when
 	// Redis exists; the rest are registered on the authenticated group. Sessions
