@@ -9,23 +9,31 @@
 # Leave some margin below the measured figure, so that a refactor elsewhere does not fail
 # the gate. The packages that guard security get the strictest numbers.
 
-TOTAL 40
+TOTAL 70
 
-internal/api/common 95
-internal/api/example 65
-internal/apierr 50
-internal/http/middleware 60
+internal/api/adminaudit 85
+internal/api/auth 72
+internal/api/common 88
+internal/api/example 60
+internal/api/users 83
+internal/apierr 80
+internal/http/middleware 85
 internal/http/middleware/ratelimit 45
+internal/http/server 55
+internal/platform/auditlog 90
+internal/platform/auth 85
 internal/platform/authz 95
-internal/platform/config 90
+internal/platform/config 85
+internal/platform/crypto 80
 internal/platform/db 30
 internal/platform/dbstats 95
 internal/platform/heartbeat 95
 internal/platform/pgdialect 60
 internal/platform/reqid 95
 internal/platform/scopequery 85
+internal/platform/sessions 95
 internal/store 95
-internal/store/repo 65
+internal/store/repo 78
 internal/worker 85
 
 # Wiring with no logic of its own.
