@@ -12,10 +12,13 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/google/uuid"
@@ -54,9 +57,20 @@ type Service struct {
 	fetchGoogleUser func(ctx context.Context, client *http.Client) (*googleUserInfo, error)
 	log             zerolog.Logger
 
+	resetRepo   repo.Repo[passwordreset.Token]
+	historyRepo repo.Repo[passwordhistory.Entry]
+	lockout     *lockout
+	mailer      email.Mailer
+	jobs        JobQueue
+
 	refreshTTL  time.Duration
 	absoluteTTL time.Duration
 	raceWindow  time.Duration
+
+	resetTTL      time.Duration
+	resetCooldown time.Duration
+	resetURL      string
+	historyCount  int
 }
 
 // NewService builds the service. d.Redis may be nil: sessions live in Postgres, and
@@ -83,14 +97,31 @@ func NewService(d Deps) *Service {
 		googleOAuth:     googleOAuth,
 		fetchGoogleUser: fetchGoogleUserInfo,
 		log:             d.Log,
-		refreshTTL:      d.Cfg.JWT.RefreshTokenExpiry,
-		absoluteTTL:     d.Cfg.AuthSecurity.SessionAbsoluteTTL,
-		raceWindow:      d.Cfg.AuthSecurity.RefreshRaceWindow,
+		resetRepo:       repo.NewGormRepo[passwordreset.Token](d.DB),
+		historyRepo:     repo.NewGormRepo[passwordhistory.Entry](d.DB),
+		lockout: &lockout{
+			db:        d.DB,
+			threshold: d.Cfg.AuthSecurity.LockoutThreshold,
+			window:    d.Cfg.AuthSecurity.LockoutWindow,
+		},
+		mailer:        d.Mailer,
+		jobs:          d.Jobs,
+		refreshTTL:    d.Cfg.JWT.RefreshTokenExpiry,
+		absoluteTTL:   d.Cfg.AuthSecurity.SessionAbsoluteTTL,
+		raceWindow:    d.Cfg.AuthSecurity.RefreshRaceWindow,
+		resetTTL:      d.Cfg.AuthSecurity.PasswordResetTTL,
+		resetCooldown: d.Cfg.AuthSecurity.PasswordResetCooldown,
+		resetURL:      d.Cfg.AuthSecurity.PasswordResetURL,
+		historyCount:  d.Cfg.AuthSecurity.PasswordHistoryCount,
 	}
 }
 
 // Register creates a new user with email/password credentials.
 func (s *Service) Register(ctx context.Context, req RegisterRequest, lc LoginContext) (*AuthResponse, error) {
+	if platformauth.ValidatePassword(req.Password) != nil {
+		return nil, weakPasswordError(req.Password)
+	}
+
 	exists, err := s.userRepo.Exists(ctx, store.QueryOpts{
 		Filters: map[string]any{"email": req.Email},
 	})
@@ -123,6 +154,15 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest, lc LoginCon
 
 // Login authenticates via email/password and starts a session.
 func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) (*AuthResponse, error) {
+	remaining, err := s.lockout.retryAfter(ctx, req.Email)
+	if err != nil {
+		return nil, apierr.InternalErr(err, "lockout check failed")
+	}
+	if remaining > 0 {
+		s.record(ctx, audit.EventLoginLocked, nil, lc.IP, nil)
+		return nil, lockedError(remaining)
+	}
+
 	u, err := s.userRepo.GetOne(ctx, store.QueryOpts{
 		Filters: map[string]any{"email": req.Email},
 	})
@@ -130,6 +170,8 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) 
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, apierr.InternalErr(err, "login lookup failed")
 		}
+		s.countFailure(ctx, req.Email)
+		// The address stays out of the row: people type passwords into the wrong field.
 		s.record(ctx, audit.EventLoginFailure, nil, lc.IP, nil)
 		return nil, apierr.Unauthorized("invalid credentials")
 	}
@@ -139,10 +181,14 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) 
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
+		s.countFailure(ctx, req.Email)
 		s.record(ctx, audit.EventLoginFailure, &u.ID, lc.IP, nil)
 		return nil, apierr.Unauthorized("invalid credentials")
 	}
 
+	if err := s.lockout.clear(ctx, req.Email); err != nil {
+		s.log.Error().Err(err).Msg("auth: failed to clear the login failure count")
+	}
 	return s.issueSession(ctx, u, session.MethodPassword, lc)
 }
 
@@ -445,6 +491,18 @@ func (s *Service) record(ctx context.Context, event string, actor *uint, ip stri
 		return
 	}
 	_ = s.audit.Record(ctx, auditlog.Entry{Event: event, ActorUserID: actor, IP: ip, Detail: detail})
+}
+
+// recordRequired writes an audit row inside a transaction, where its failure must undo
+// the change: a privileged action with no record is worse than one that did not happen.
+func (s *Service) recordRequired(ctx context.Context, e auditlog.Entry) error {
+	if s.audit == nil {
+		return nil
+	}
+	if err := s.audit.Record(ctx, e); err != nil {
+		return apierr.InternalErr(err, "failed to record audit event")
+	}
+	return nil
 }
 
 type googleUserInfo struct {

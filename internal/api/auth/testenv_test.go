@@ -1,16 +1,21 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/loginfailure"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
@@ -18,6 +23,7 @@ import (
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/worker"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -28,15 +34,57 @@ import (
 )
 
 const (
-	testSecret   = "test-secret-test-secret-test-secret"
-	testPassword = "correct-horse-battery"
-	raceWindow   = 30 * time.Second
+	testSecret    = "test-secret-test-secret-test-secret"
+	testPassword  = "correct-horse-battery"
+	raceWindow    = 30 * time.Second
+	lockoutWindow = 15 * time.Minute
 )
 
 type testEnv struct {
 	db     *gorm.DB
 	router *gin.Engine
 	deps   Deps
+	mailer *recordingMailer
+}
+
+type sentMail struct{ to, subject, body string }
+
+// recordingMailer keeps what was sent.
+type recordingMailer struct {
+	mu   sync.Mutex
+	sent []sentMail
+}
+
+func (m *recordingMailer) Send(_ context.Context, to, subject, body string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, sentMail{to, subject, body})
+	return nil
+}
+
+func (m *recordingMailer) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sent)
+}
+
+func (m *recordingMailer) last(t *testing.T) sentMail {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sent) == 0 {
+		t.Fatal("no email was sent")
+	}
+	return m.sent[len(m.sent)-1]
+}
+
+// syncJobs runs a job before Enqueue returns, so tests can assert on its effects. The
+// test that proves the handler does not wait uses a real worker instead.
+type syncJobs struct{}
+
+func (syncJobs) Enqueue(job worker.Job) error {
+	_ = job(context.Background())
+	return nil
 }
 
 func testConfig() config.Config {
@@ -47,8 +95,13 @@ func testConfig() config.Config {
 			TokenExpiration: 15 * time.Minute, RefreshTokenExpiry: time.Hour,
 		},
 		AuthSecurity: config.AuthSecurityConfig{
-			SessionAbsoluteTTL: 24 * time.Hour,
-			RefreshRaceWindow:  raceWindow,
+			SessionAbsoluteTTL:   24 * time.Hour,
+			RefreshRaceWindow:    raceWindow,
+			LockoutThreshold:     3,
+			LockoutWindow:        lockoutWindow,
+			PasswordResetTTL:     time.Hour,
+			PasswordHistoryCount: 2,
+			PasswordResetURL:     "https://app.example.com/reset-password",
 		},
 	}
 }
@@ -71,7 +124,9 @@ func openTestDB(t *testing.T) *gorm.DB {
 		platform_role text default 'user', google_id text, avatar_url text)`).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&audit.Log{}, &session.Session{}); err != nil {
+	if err := db.AutoMigrate(
+		&audit.Log{}, &session.Session{}, &passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -82,17 +137,20 @@ func newEnv(t *testing.T, edit ...func(*Deps)) *testEnv {
 	gin.SetMode(gin.TestMode)
 	db := openTestDB(t)
 	cfg := testConfig()
+	mailer := &recordingMailer{}
 	d := Deps{
 		Cfg:    cfg,
 		DB:     db,
 		Issuer: platformauth.NewJWTIssuer(testSecret, "iss", "aud", cfg.JWT.TokenExpiration),
 		Audit:  auditlog.NewRecorder(repo.NewGormRepo[audit.Log](db), zerolog.Nop()),
 		Log:    zerolog.Nop(),
+		Mailer: mailer,
+		Jobs:   syncJobs{},
 	}
 	for _, f := range edit {
 		f(&d)
 	}
-	return &testEnv{db: db, router: buildRouter(d), deps: d}
+	return &testEnv{db: db, router: buildRouter(d), deps: d, mailer: mailer}
 }
 
 // buildRouter wires the module behind the real UserAuth, so these tests exercise what a

@@ -97,6 +97,49 @@ func (h *Handler) Logout(c *gin.Context) {
 	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "logged out"})
 }
 
+// ChangePassword changes the caller's password.
+func (h *Handler) ChangePassword(c *gin.Context) {
+	var req ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	if err := h.svc.ChangePassword(c.Request.Context(), userID, claims.SID, req, c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "password changed"})
+}
+
+// ForgotPassword always answers the same way for a well-formed address, known or not. A
+// malformed one is refused, which says something about the request and nothing about any
+// account.
+func (h *Handler) ForgotPassword(c *gin.Context) {
+	var req ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	h.svc.RequestPasswordReset(req.Email, loginContext(c))
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "if that address has an account, a reset link is on its way"})
+}
+
+// ResetPassword redeems an emailed reset token.
+func (h *Handler) ResetPassword(c *gin.Context) {
+	var req ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	if err := h.svc.ResetPassword(c.Request.Context(), req, loginContext(c)); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "password reset"})
+}
+
 // ListSessions serves the caller's live sessions.
 func (h *Handler) ListSessions(c *gin.Context) {
 	userID, _ := middleware.GetActorUserID(c)

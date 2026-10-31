@@ -50,7 +50,8 @@ type Log struct {
 	ID        uint      `gorm:"primaryKey"               json:"id"`
 	CreatedAt time.Time `gorm:"index;not null"           json:"created_at"`
 	Event     string    `gorm:"type:text;not null;index" json:"event"`
-	// ActorUserID is who the request authenticated as; nil when nobody did.
+	// ActorUserID is who the request authenticated as, or the account a failed sign-in
+	// named; nil when neither is known.
 	ActorUserID *uint `gorm:"index" json:"actor_user_id,omitempty"`
 	// ImpersonatorUserID names the admin behind a "login as" session on each row that
 	// session writes, which keeps the impersonated user from looking solely responsible.

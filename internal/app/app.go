@@ -91,7 +91,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		}
 		redisClient = rc
 	} else {
-		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — rate limiting is unavailable; auth endpoints run unthrottled")
+		log.Warn().Msg("redis: disabled (REDIS_ENABLED=false) — rate limiting is unavailable; login lockout is the only brake on the auth endpoints")
 	}
 
 	// Email: real SMTP when a host is configured, noop otherwise. Production
@@ -122,6 +122,7 @@ func Build(build versioning.BuildInfo) (*App, error) {
 		ObjStore: s3Store,
 		Redis:    redisClient,
 		Worker:   w,
+		Mailer:   mailer,
 	}
 
 	handler, err := httpserver.NewRouter(deps, build)

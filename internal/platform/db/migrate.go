@@ -2,7 +2,10 @@ package db
 
 import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/loginfailure"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/note"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/go-gormigrate/gormigrate/v2"
@@ -62,6 +65,15 @@ func migrations() []*gormigrate.Migration {
 			},
 			Rollback: func(tx *gorm.DB) error {
 				return tx.Migrator().DropTable(&session.Session{})
+			},
+		},
+		{
+			ID: "0005_password_recovery",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.AutoMigrate(&passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{})
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return tx.Migrator().DropTable(&passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{})
 			},
 		},
 	}

@@ -8,13 +8,30 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 )
 
-// RegisterRequest caps Password at 72 bytes because bcrypt silently truncates
-// input beyond that length — without the cap, the tail of a long password is
-// ignored.
+// RegisterRequest leaves the password's length to platformauth.ValidatePassword, the one
+// place the policy is defined. The binder's max counts characters, not the bytes bcrypt
+// is limited by.
 type RegisterRequest struct {
 	Name     string `json:"name"     binding:"required"`
 	Email    string `json:"email"    binding:"required,email"`
-	Password string `json:"password" binding:"required,min=8,max=72"`
+	Password string `json:"password" binding:"required"`
+}
+
+// ChangePasswordRequest changes the caller's own password.
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required"`
+	NewPassword     string `json:"new_password"     binding:"required"`
+}
+
+// ForgotPasswordRequest asks for a reset link.
+type ForgotPasswordRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+// ResetPasswordRequest carries the token from a reset email and the password to set.
+type ResetPasswordRequest struct {
+	Token       string `json:"token"        binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
 }
 
 type LoginRequest struct {

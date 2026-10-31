@@ -151,6 +151,8 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 		Redis:     rawRedis,
 		Audit:     recorder,
 		Log:       deps.Log,
+		Mailer:    deps.Mailer,
+		Jobs:      deps.Worker,
 		AuthLimit: authLimit,
 	})
 

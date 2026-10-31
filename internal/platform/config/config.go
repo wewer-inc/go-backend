@@ -33,13 +33,25 @@ type JWTConfig struct {
 	RefreshTokenExpiry time.Duration
 }
 
-// AuthSecurityConfig holds session policy.
+// AuthSecurityConfig groups the sign-in settings: how long a session lasts, when an address
+// is locked out, and the rules for password resets and reuse.
 type AuthSecurityConfig struct {
 	// SessionAbsoluteTTL is the hard cap on a session; refreshing never extends it.
 	SessionAbsoluteTTL time.Duration
 	// RefreshRaceWindow is how long after a rotation the previous refresh token counts as a
 	// concurrent caller rather than a replay.
 	RefreshRaceWindow time.Duration
+	// LockoutThreshold is failed sign-ins per address before lockout; 0 disables it.
+	LockoutThreshold int
+	LockoutWindow    time.Duration
+	// PasswordResetURL is the page in your client that takes the emailed token. Reset emails
+	// are not sent while it is empty.
+	PasswordResetURL string
+	PasswordResetTTL time.Duration
+	// PasswordResetCooldown is the minimum gap between reset emails to one account.
+	PasswordResetCooldown time.Duration
+	// PasswordHistoryCount is how many previous passwords a new one must differ from.
+	PasswordHistoryCount int
 }
 
 type GoogleOAuthConfig struct {
@@ -229,6 +241,14 @@ func loadAuthSecurity() AuthSecurityConfig {
 	return AuthSecurityConfig{
 		SessionAbsoluteTTL: parseDuration("SESSION_ABSOLUTE_TTL", 720*time.Hour), // 30 days
 		RefreshRaceWindow:  parseDuration("REFRESH_RACE_WINDOW", 30*time.Second),
+
+		LockoutThreshold: parseInt("AUTH_LOCKOUT_THRESHOLD", 5),
+		LockoutWindow:    parseDuration("AUTH_LOCKOUT_WINDOW", 15*time.Minute),
+
+		PasswordResetURL:      os.Getenv("PASSWORD_RESET_URL"),
+		PasswordResetTTL:      parseDuration("PASSWORD_RESET_TTL", time.Hour),
+		PasswordResetCooldown: parseDuration("PASSWORD_RESET_COOLDOWN", 2*time.Minute),
+		PasswordHistoryCount:  parseInt("PASSWORD_HISTORY_COUNT", 3),
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	pdb "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/db"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/pgtest"
+	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
 )
 
@@ -22,19 +23,24 @@ import (
 // connection pool, where a race on the rotation is a real race.
 func newPGEnv(t *testing.T) *testEnv {
 	t.Helper()
+	gin.SetMode(gin.TestMode)
 	db := pgtest.Open(t)
 	if err := pdb.UpMigrations(db, zerolog.Nop()); err != nil {
 		t.Fatal(err)
 	}
 	cfg := testConfig()
+	cfg.AuthSecurity.PasswordResetCooldown = time.Hour
+	mailer := &recordingMailer{}
 	d := Deps{
 		Cfg:    cfg,
 		DB:     db,
 		Issuer: platformauth.NewJWTIssuer(testSecret, "iss", "aud", cfg.JWT.TokenExpiration),
 		Audit:  auditlog.NewGormRecorder(db, zerolog.Nop()),
 		Log:    zerolog.Nop(),
+		Mailer: mailer,
+		Jobs:   syncJobs{},
 	}
-	return &testEnv{db: db, router: buildRouter(d), deps: d}
+	return &testEnv{db: db, router: buildRouter(d), deps: d, mailer: mailer}
 }
 
 func TestConcurrentRefreshOnPostgres(t *testing.T) {

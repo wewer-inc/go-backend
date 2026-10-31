@@ -4,6 +4,8 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/worker"
 	"github.com/gin-gonic/gin"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
@@ -18,8 +20,15 @@ type Deps struct {
 	Redis  *goredis.Client // optional
 	Audit  *auditlog.Recorder
 	Log    zerolog.Logger
+	Mailer email.Mailer
+	Jobs   JobQueue
 	// AuthLimit, if non-nil, is the strict rate limit on the public endpoints.
 	AuthLimit gin.HandlerFunc
+}
+
+// JobQueue is the part of worker.Worker this module uses.
+type JobQueue interface {
+	Enqueue(job worker.Job) error
 }
 
 // RegisterRoutes wires auth endpoints.
@@ -37,6 +46,8 @@ func RegisterRoutes(v1, secured *gin.RouterGroup, d Deps) {
 		pub.POST("/register", h.Register)
 		pub.POST("/login", h.Login)
 		pub.POST("/refresh", h.Refresh)
+		pub.POST("/forgot-password", h.ForgotPassword)
+		pub.POST("/reset-password", h.ResetPassword)
 		pub.GET("/google", h.GoogleRedirect)
 		pub.GET("/google/callback", h.GoogleCallback)
 	}
@@ -45,6 +56,7 @@ func RegisterRoutes(v1, secured *gin.RouterGroup, d Deps) {
 	sec := secured.Group("/auth")
 	{
 		sec.POST("/logout", h.Logout)
+		sec.POST("/change-password", h.ChangePassword)
 		sec.GET("/permissions", h.Permissions)
 		sec.GET("/sessions", h.ListSessions)
 		sec.DELETE("/sessions", h.RevokeOtherSessions)
