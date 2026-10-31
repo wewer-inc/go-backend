@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,7 +21,7 @@ func gated(subject *authz.Subject, gate gin.HandlerFunc) *httptest.ResponseRecor
 	})
 	r.GET("/x", gate, func(c *gin.Context) { c.Status(http.StatusOK) })
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/x", nil))
+	r.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil))
 	return w
 }
 

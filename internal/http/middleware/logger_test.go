@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -30,7 +31,7 @@ func TestLoggerRecordsTheCauseOfAFailedRequest(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/things/42", nil))
+	r.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/things/42", nil))
 
 	var line map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
@@ -52,7 +53,7 @@ func TestLoggerOmitsClientIPOnSuccess(t *testing.T) {
 	r := logRouter(&buf)
 	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ok", nil))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ok", nil))
 
 	if bytes.Contains(buf.Bytes(), []byte("client_ip")) {
 		t.Fatalf("healthy line carries the client IP: %s", buf.String())
@@ -65,13 +66,13 @@ func TestLoggerSkipsHealthyProbesOnly(t *testing.T) {
 	status := http.StatusOK
 	r.GET("/ready", func(c *gin.Context) { c.Status(status) })
 
-	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ready", nil))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ready", nil))
 	if buf.Len() != 0 {
 		t.Fatalf("healthy probe was logged: %s", buf.String())
 	}
 
 	status = http.StatusServiceUnavailable
-	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ready", nil))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ready", nil))
 	if buf.Len() == 0 {
 		t.Fatal("a failing probe must be logged")
 	}
@@ -84,7 +85,7 @@ func TestHandlerSeesTheRequestIDFromTheResponseHeader(t *testing.T) {
 	r.GET("/x", func(c *gin.Context) { seen = reqid.FromContext(c.Request.Context()) })
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/x", nil))
+	r.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil))
 
 	if seen == "" || seen != w.Header().Get("X-Request-ID") {
 		t.Fatalf("context id %q, header %q", seen, w.Header().Get("X-Request-ID"))

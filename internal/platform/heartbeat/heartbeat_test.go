@@ -47,6 +47,21 @@ func TestBeatsAtOnceWithFieldsAndStopsCleanly(t *testing.T) {
 	}
 }
 
-func TestStopWithoutStartIsSafe(t *testing.T) {
+func TestBeatsAgainOnEveryTick(t *testing.T) {
+	var buf safeBuffer
+	b := New(zerolog.New(&buf), time.Millisecond)
+	b.Start()
+	defer b.Stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for strings.Count(buf.String(), Message) < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("too few beats: %s", buf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestStopWithoutStartIsSafe(_ *testing.T) {
 	New(zerolog.Nop(), time.Hour).Stop()
 }

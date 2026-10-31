@@ -20,26 +20,6 @@ type logRow struct {
 	Email string `gorm:"uniqueIndex"`
 }
 
-func TestReadyCheckPassesUntilThePoolIsStopped(t *testing.T) {
-	gdb, _ := openLogged(t, Config{SlowThreshold: time.Hour})
-	ctx := context.Background()
-
-	for _, timeout := range []time.Duration{time.Second, 0} {
-		if err := ReadyCheck(ctx, gdb, timeout); err != nil {
-			t.Fatalf("timeout %v: %v", timeout, err)
-		}
-	}
-	if pool, err := SQLDB(gdb); err != nil || pool == nil {
-		t.Fatalf("SQLDB = %v, %v", pool, err)
-	}
-	if err := Stop(gdb); err != nil {
-		t.Fatal(err)
-	}
-	if err := ReadyCheck(ctx, gdb, time.Second); err == nil {
-		t.Fatal("a stopped pool must not report ready")
-	}
-}
-
 func openLogged(t *testing.T, cfg Config) (*gorm.DB, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -54,18 +34,18 @@ func openLogged(t *testing.T, cfg Config) (*gorm.DB, *bytes.Buffer) {
 	return gdb, &buf
 }
 
-func failInsert(gdb *gorm.DB, ctx context.Context) error {
+func failInsert(ctx context.Context, gdb *gorm.DB) error {
 	return gdb.WithContext(ctx).Create(&logRow{ID: 1, Email: "secret@example.com"}).Error
 }
 
 func TestSQLLogRedactsValuesByDefault(t *testing.T) {
 	gdb, buf := openLogged(t, Config{SlowThreshold: time.Hour})
 	ctx := context.Background()
-	if err := failInsert(gdb, ctx); err != nil {
+	if err := failInsert(ctx, gdb); err != nil {
 		t.Fatal(err)
 	}
 	buf.Reset()
-	if err := failInsert(gdb, ctx); err == nil {
+	if err := failInsert(ctx, gdb); err == nil {
 		t.Fatal("the duplicate insert should fail")
 	}
 	if buf.Len() == 0 {
@@ -79,9 +59,9 @@ func TestSQLLogRedactsValuesByDefault(t *testing.T) {
 func TestSQLLogCanOptInToValues(t *testing.T) {
 	gdb, buf := openLogged(t, Config{SlowThreshold: time.Hour, LogQueryValues: true})
 	ctx := context.Background()
-	_ = failInsert(gdb, ctx)
+	_ = failInsert(ctx, gdb)
 	buf.Reset()
-	_ = failInsert(gdb, ctx)
+	_ = failInsert(ctx, gdb)
 	if !strings.Contains(buf.String(), "secret@example.com") {
 		t.Fatalf("opted-in value missing: %s", buf.String())
 	}
@@ -89,11 +69,11 @@ func TestSQLLogCanOptInToValues(t *testing.T) {
 
 func TestSQLLogIsQuietAboutExpectedErrorsOnly(t *testing.T) {
 	gdb, buf := openLogged(t, Config{SlowThreshold: time.Hour})
-	_ = failInsert(gdb, context.Background())
+	_ = failInsert(context.Background(), gdb)
 	buf.Reset()
 
 	ctx := store.ExpectError(context.Background(), func(err error) bool { return err != nil })
-	if err := failInsert(gdb, ctx); err == nil {
+	if err := failInsert(ctx, gdb); err == nil {
 		t.Fatal("the error must still reach the caller")
 	}
 	if buf.Len() != 0 {
@@ -102,7 +82,7 @@ func TestSQLLogIsQuietAboutExpectedErrorsOnly(t *testing.T) {
 
 	other := errors.New("not this one")
 	ctx = store.ExpectError(context.Background(), func(err error) bool { return errors.Is(err, other) })
-	_ = failInsert(gdb, ctx)
+	_ = failInsert(ctx, gdb)
 	if buf.Len() == 0 {
 		t.Fatal("an unmatched error must still be logged")
 	}
@@ -110,9 +90,9 @@ func TestSQLLogIsQuietAboutExpectedErrorsOnly(t *testing.T) {
 
 func TestSQLLogNamesTheCallerNotTheWrapper(t *testing.T) {
 	gdb, buf := openLogged(t, Config{SlowThreshold: time.Hour})
-	_ = failInsert(gdb, context.Background())
+	_ = failInsert(context.Background(), gdb)
 	buf.Reset()
-	_ = failInsert(gdb, context.Background())
+	_ = failInsert(context.Background(), gdb)
 	if strings.Contains(buf.String(), "sqllog") {
 		t.Fatalf("log names the wrapper as the call site: %s", buf.String())
 	}
@@ -145,4 +125,24 @@ func TestPoolStatsFieldsWritesTheDict(t *testing.T) {
 		t.Fatalf("missing dict: %s", buf.String())
 	}
 	PoolStatsFields(nil)(log.Info())
+}
+
+func TestReadyCheckPassesUntilThePoolIsStopped(t *testing.T) {
+	gdb, _ := openLogged(t, Config{SlowThreshold: time.Hour})
+	ctx := context.Background()
+
+	for _, timeout := range []time.Duration{time.Second, 0} {
+		if err := ReadyCheck(ctx, gdb, timeout); err != nil {
+			t.Fatalf("timeout %v: %v", timeout, err)
+		}
+	}
+	if pool, err := SQLDB(gdb); err != nil || pool == nil {
+		t.Fatalf("SQLDB = %v, %v", pool, err)
+	}
+	if err := Stop(gdb); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReadyCheck(ctx, gdb, time.Second); err == nil {
+		t.Fatal("a stopped pool must not report ready")
+	}
 }

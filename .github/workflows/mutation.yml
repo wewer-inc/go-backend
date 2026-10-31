@@ -1,0 +1,31 @@
+name: Mutation testing
+
+# Takes too long for pull requests, so it runs weekly and on request. It checks the tests
+# around the packages that guard security in a way coverage cannot: a line can be executed
+# by a test that checks nothing about it, and only a mutant surviving will reveal that.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday morning
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  GREMLINS_VERSION: v0.6.0
+
+jobs:
+  mutation:
+    name: Gremlins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install gremlins
+        run: go install "github.com/go-gremlins/gremlins/cmd/gremlins@${GREMLINS_VERSION}"
+      - name: Run mutation testing
+        run: make mutate

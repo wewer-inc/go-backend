@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,7 @@ func TestDeniedRequestNeverReachesTheHandler(t *testing.T) {
 
 	do := func() *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil)
 		req.RemoteAddr = "203.0.113.9:1234"
 		r.ServeHTTP(w, req)
 		return w
@@ -69,7 +70,7 @@ func TestKeyedBucketIsPerKeyAndFailsClosedWithoutOne(t *testing.T) {
 
 	do := func(key string) int {
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil)
 		if key != "" {
 			req.Header.Set("X-Key", key)
 		}

@@ -1,0 +1,35 @@
+# Minimum statement coverage checked by scripts/coverage-gate.sh. A number in this file
+# may be raised but never lowered.
+#
+# Each entry takes one of three forms:
+#   a package path, relative to the module root, then the percentage it must reach
+#   TOTAL, then the percentage the module as a whole must reach
+#   EXCLUDE, then a package path that does not count towards TOTAL
+#
+# Leave some margin below the measured figure, so that a refactor elsewhere does not fail
+# the gate. The packages that guard security get the strictest numbers.
+
+TOTAL 40
+
+internal/api/common 95
+internal/api/example 65
+internal/apierr 50
+internal/http/middleware 60
+internal/http/middleware/ratelimit 45
+internal/platform/authz 95
+internal/platform/config 90
+internal/platform/db 30
+internal/platform/dbstats 95
+internal/platform/heartbeat 95
+internal/platform/pgdialect 60
+internal/platform/reqid 95
+internal/platform/scopequery 85
+internal/store 95
+internal/store/repo 65
+internal/worker 85
+
+# Wiring with no logic of its own.
+EXCLUDE internal/app
+EXCLUDE internal/entities/user
+EXCLUDE internal/platform/logger
+EXCLUDE internal/platform/metrics

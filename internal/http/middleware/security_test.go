@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,10 +11,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func bodyRouter(max int64, exempt ...string) (*gin.Engine, *string) {
+func bodyRouter(limit int64, exempt ...string) (*gin.Engine, *string) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.Use(BodyLimit(max), RejectNULBytes(exempt...))
+	r.Use(BodyLimit(limit), RejectNULBytes(exempt...))
 	seen := new(string)
 	r.POST("/x", func(c *gin.Context) {
 		b, _ := io.ReadAll(c.Request.Body)
@@ -24,7 +25,7 @@ func bodyRouter(max int64, exempt ...string) (*gin.Engine, *string) {
 }
 
 func post(r http.Handler, contentType, body string, chunked bool) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/x", strings.NewReader(body))
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
