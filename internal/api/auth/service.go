@@ -195,7 +195,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest, lc LoginCon
 // Login authenticates via email/password. It starts a session, or, on an account with MFA
 // on, returns the challenge that must be passed first.
 func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) (*AuthResponse, *MFAChallengeResponse, error) {
-	remaining, err := s.lockout.retryAfter(ctx, req.Email)
+	remaining, err := s.lockout.reserve(ctx, req.Email)
 	if err != nil {
 		return nil, nil, apierr.InternalErr(err, "lockout check failed")
 	}
@@ -211,32 +211,31 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) 
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil, apierr.InternalErr(err, "login lookup failed")
 		}
-		s.countFailure(ctx, req.Email)
 		// The address stays out of the row: people type passwords into the wrong field.
 		s.record(ctx, audit.EventLoginFailure, nil, lc.IP, nil)
 		return nil, nil, apierr.Unauthorized("invalid credentials")
 	}
 
 	if u.PasswordHash == "" {
+		s.releaseAttempt(ctx, req.Email)
 		return nil, nil, apierr.BadRequest("oauth_only", "this account uses Google sign-in")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
-		s.countFailure(ctx, req.Email)
 		s.record(ctx, audit.EventLoginFailure, &u.ID, lc.IP, nil)
 		return nil, nil, apierr.Unauthorized("invalid credentials")
 	}
 
-	// The failure count survives until the second factor passes. Otherwise someone holding
-	// the password could reset it by signing in again, and guess codes without limit.
+	// Earlier failures stay counted until the second factor passes. Otherwise someone
+	// holding the password could reset the count by signing in again, and guess codes
+	// without limit.
 	if u.MFAEnrolledAt != nil {
+		s.releaseAttempt(ctx, req.Email)
 		challenge, err := s.startChallenge(ctx, u, session.MethodPassword)
 		return nil, challenge, err
 	}
 
-	if err := s.lockout.clear(ctx, req.Email); err != nil {
-		s.log.Error().Err(err).Msg("auth: failed to clear the login failure count")
-	}
+	s.clearAttempts(ctx, req.Email)
 	resp, err := s.issueSession(ctx, u, session.MethodPassword, lc)
 	return resp, nil, err
 }

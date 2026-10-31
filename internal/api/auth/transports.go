@@ -69,9 +69,21 @@ type EnrollStartResponse struct {
 	QR         string `json:"qr"` // PNG data URI
 }
 
+// MFAEnrollStartRequest re-authenticates the caller. The password is required on an
+// account that has one; an account without one may send an empty body.
+type MFAEnrollStartRequest struct {
+	CurrentPassword string `json:"current_password"`
+}
+
 // MFACodeRequest carries a TOTP code.
 type MFACodeRequest struct {
 	Code string `json:"code" binding:"required,max=32"`
+}
+
+// MFARegenerateRequest re-authenticates the caller, and proves they still hold the device.
+type MFARegenerateRequest struct {
+	CurrentPassword string `json:"current_password"`
+	Code            string `json:"code" binding:"required,max=32"`
 }
 
 // BackupCodesResponse carries plaintext codes, which are never available again.

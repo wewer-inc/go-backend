@@ -42,7 +42,8 @@ func newAuthEnv(t *testing.T) *authEnv {
 	if err := db.Exec(`CREATE TABLE users (
 		id integer primary key, created_at datetime, updated_at datetime, deleted_at datetime,
 		uuid text, email text, password_hash text, name text, platform_role text, google_id text, avatar_url text,
-		totp_secret_enc text, mfa_enrolled_at datetime, mfa_pending_secret_enc text, mfa_pending_at datetime)`).Error; err != nil {
+		totp_secret_enc text, mfa_enrolled_at datetime, mfa_pending_secret_enc text, mfa_pending_at datetime,
+		totp_last_step integer)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(&session.Session{}); err != nil {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 
 	apicommon "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/api/common"
@@ -85,8 +86,15 @@ func (h *Handler) MFAVerify(c *gin.Context) {
 
 // MFAEnrollStart begins turning MFA on for the caller.
 func (h *Handler) MFAEnrollStart(c *gin.Context) {
+	var req MFAEnrollStartRequest
+	// An empty body is fine for an account with no password to send.
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		apicommon.RespondBindError(c, err)
+		return
+	}
 	userID, _ := middleware.GetActorUserID(c)
-	resp, err := h.svc.StartEnrollment(c.Request.Context(), userID)
+	claims, _ := middleware.GetActorClaims(c)
+	resp, err := h.svc.StartEnrollment(c.Request.Context(), userID, claims.SID, req.CurrentPassword)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -124,13 +132,14 @@ func (h *Handler) MFAStatus(c *gin.Context) {
 
 // MFARegenerateBackupCodes replaces the caller's backup codes.
 func (h *Handler) MFARegenerateBackupCodes(c *gin.Context) {
-	var req MFACodeRequest
+	var req MFARegenerateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		apicommon.RespondBindError(c, err)
 		return
 	}
 	userID, _ := middleware.GetActorUserID(c)
-	codes, err := h.svc.RegenerateBackupCodes(c.Request.Context(), userID, req.Code, c.ClientIP())
+	claims, _ := middleware.GetActorClaims(c)
+	codes, err := h.svc.RegenerateBackupCodes(c.Request.Context(), userID, claims.SID, req.CurrentPassword, req.Code, c.ClientIP())
 	if err != nil {
 		respondError(c, err)
 		return

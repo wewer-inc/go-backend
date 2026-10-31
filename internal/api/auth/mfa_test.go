@@ -7,9 +7,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/mfa"
@@ -21,14 +23,24 @@ import (
 	"golang.org/x/oauth2"
 )
 
+func (e *testEnv) enrollStart(t *testing.T, access string) *httptest.ResponseRecorder {
+	t.Helper()
+	return e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, mustJSON(t, MFAEnrollStartRequest{CurrentPassword: testPassword}))
+}
+
+func (e *testEnv) regenerate(t *testing.T, access, password, code string) *httptest.ResponseRecorder {
+	t.Helper()
+	return e.request(http.MethodPost, "/v1/auth/mfa/backup-codes/regenerate", access, mustJSON(t, MFARegenerateRequest{CurrentPassword: password, Code: code}))
+}
+
 func (e *testEnv) enroll(t *testing.T, access string) (secret string, codes []string) {
 	t.Helper()
-	w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, "")
+	w := e.enrollStart(t, access)
 	if w.Code != http.StatusOK {
 		t.Fatalf("enroll start: %d %s", w.Code, w.Body.String())
 	}
 	secret = decodeData[EnrollStartResponse](t, w).Secret
-	w = e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: totpNow(t, secret)}))
+	w = e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: e.code(t, secret)}))
 	if w.Code != http.StatusOK {
 		t.Fatalf("enroll confirm: %d %s", w.Code, w.Body.String())
 	}
@@ -37,11 +49,27 @@ func (e *testEnv) enroll(t *testing.T, access string) (secret string, codes []st
 
 func totpNow(t *testing.T, secret string) string {
 	t.Helper()
-	code, err := totp.GenerateCode(secret, time.Now())
+	return totpAt(t, secret, time.Now())
+}
+
+func totpAt(t *testing.T, secret string, at time.Time) string {
+	t.Helper()
+	code, err := totp.GenerateCode(secret, at)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return code
+}
+
+// code returns a usable TOTP code. A test cannot wait out a 30-second step between
+// sign-ins, so this forgets the replay guard's stored step first. The tests of that guard
+// use totpNow, which leaves it in place.
+func (e *testEnv) code(t *testing.T, secret string) string {
+	t.Helper()
+	if err := e.db.Exec(`UPDATE users SET totp_last_step = NULL`).Error; err != nil {
+		t.Fatal(err)
+	}
+	return totpNow(t, secret)
 }
 
 // challenge signs in with the password and returns the MFA token.
@@ -76,7 +104,7 @@ func TestEnrollmentStoresTheSecretEncrypted(t *testing.T) {
 	u := e.addUser(t, entities.RoleUser)
 	access := e.login(t, u).AccessToken
 
-	w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, "")
+	w := e.enrollStart(t, access)
 	if w.Code != http.StatusOK {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -104,7 +132,7 @@ func TestEnrollmentStoresTheSecretEncrypted(t *testing.T) {
 		t.Fatalf("wrong first code: %d", w.Code)
 	}
 
-	w = e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: totpNow(t, start.Secret)}))
+	w = e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: e.code(t, start.Secret)}))
 	if w.Code != http.StatusOK {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -159,7 +187,7 @@ func TestEnrollmentIsRefusedWithoutAUsableKey(t *testing.T) {
 			u := e.addUser(t, entities.RoleUser)
 			access := e.login(t, u).AccessToken
 
-			w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, "")
+			w := e.enrollStart(t, access)
 			if w.Code != http.StatusServiceUnavailable || errorCode(t, w) != "mfa_unavailable" {
 				t.Fatalf("%d %s", w.Code, w.Body.String())
 			}
@@ -181,11 +209,11 @@ func TestEnrollmentExpires(t *testing.T) {
 	e := newEnv(t)
 	u := e.addUser(t, entities.RoleUser)
 	access := e.login(t, u).AccessToken
-	secret := decodeData[EnrollStartResponse](t, e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, "")).Secret
+	secret := decodeData[EnrollStartResponse](t, e.enrollStart(t, access)).Secret
 	if err := e.db.Model(u).Update("mfa_pending_at", time.Now().Add(-time.Hour)).Error; err != nil {
 		t.Fatal(err)
 	}
-	w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: totpNow(t, secret)}))
+	w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: e.code(t, secret)}))
 	if w.Code != http.StatusBadRequest || errorCode(t, w) != "enrollment_expired" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -196,8 +224,311 @@ func TestEnrollingTwiceIsRefused(t *testing.T) {
 	u := e.addUser(t, entities.RoleUser)
 	access := e.login(t, u).AccessToken
 	e.enroll(t, access)
-	if w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, ""); w.Code != http.StatusConflict {
+	if w := e.enrollStart(t, access); w.Code != http.StatusConflict {
 		t.Fatalf("%d", w.Code)
+	}
+}
+
+func TestEnrollmentNeedsTheCurrentPassword(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	access := e.login(t, u).AccessToken
+
+	cases := []struct {
+		name, body, code string
+	}{
+		{"no body", "", apierr.CodeFieldRequired},
+		{"no password", `{}`, apierr.CodeFieldRequired},
+		{"wrong password", mustJSON(t, MFAEnrollStartRequest{CurrentPassword: "not-the-password"}), "current_password_incorrect"},
+	}
+	for _, tc := range cases {
+		w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, tc.body)
+		if w.Code != http.StatusBadRequest || errorCode(t, w) != tc.code {
+			t.Errorf("%s: %d %s", tc.name, w.Code, w.Body.String())
+		}
+	}
+	var after user.User
+	if err := e.db.First(&after, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.MFAPendingSecretEnc != "" {
+		t.Fatal("a secret was staged without re-authentication")
+	}
+	if w := e.enrollStart(t, access); w.Code != http.StatusOK {
+		t.Fatalf("right password: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestWrongPasswordAtEnrollmentCountsTowardLockout(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	access := e.login(t, u).AccessToken
+	body := mustJSON(t, MFAEnrollStartRequest{CurrentPassword: "not-the-password"})
+	for i := 0; i < 3; i++ {
+		e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", access, body)
+	}
+	if w := e.enrollStart(t, access); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
+// With no password to ask for, only a session signed in moments ago may do this.
+func TestGoogleOnlyAccountNeedsARecentSignIn(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	tokens := e.login(t, u)
+	if err := e.db.Model(u).Update("password_hash", "").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", tokens.AccessToken, ""); w.Code != http.StatusOK {
+		t.Fatalf("a recent sign-in: %d %s", w.Code, w.Body.String())
+	}
+
+	s := e.sessionByRefresh(t, tokens.RefreshToken)
+	if err := e.db.Model(s).UpdateColumn("created_at", time.Now().Add(-reauthWindow-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", tokens.AccessToken, "")
+	if w.Code != http.StatusForbidden || errorCode(t, w) != "reauthentication_required" {
+		t.Fatalf("an old session: %d %s", w.Code, w.Body.String())
+	}
+
+	// Refreshing must not make a stolen session look recent.
+	refreshed := decodeData[AuthResponse](t, e.refresh(t, tokens.RefreshToken)).Tokens
+	if w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/start", refreshed.AccessToken, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("a refreshed session: %d", w.Code)
+	}
+}
+
+func TestSecurityChangesAreEmailed(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	access := e.login(t, u).AccessToken
+	secret, _ := e.enroll(t, access)
+	if m := e.mailer.last(t); m.to != u.Email || !strings.Contains(m.subject, "turned on") {
+		t.Fatalf("enrollment notice: %+v", m)
+	}
+	if strings.Contains(e.mailer.last(t).body, secret) {
+		t.Fatal("the secret was emailed")
+	}
+	w := e.regenerate(t, access, testPassword, e.code(t, secret))
+	if w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	m := e.mailer.last(t)
+	if m.to != u.Email || !strings.Contains(m.subject, "backup codes") {
+		t.Fatalf("regeneration notice: %+v", m)
+	}
+	for _, c := range decodeData[BackupCodesResponse](t, w).BackupCodes {
+		if strings.Contains(m.body, c) {
+			t.Fatal("a backup code was emailed")
+		}
+	}
+}
+
+func TestRegeneratingNeedsThePasswordAndTheDevice(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	access := e.login(t, u).AccessToken
+	secret, codes := e.enroll(t, access)
+
+	if w := e.regenerate(t, access, "", e.code(t, secret)); w.Code != http.StatusBadRequest {
+		t.Fatalf("no password: %d", w.Code)
+	}
+	if w := e.regenerate(t, access, "not-the-password", e.code(t, secret)); w.Code != http.StatusBadRequest || errorCode(t, w) != "current_password_incorrect" {
+		t.Fatalf("wrong password: %d %s", w.Code, w.Body.String())
+	}
+	if w := e.regenerate(t, access, testPassword, "000000"); w.Code != http.StatusForbidden {
+		t.Fatalf("wrong code: %d", w.Code)
+	}
+	// Nothing was replaced by any of those.
+	if w := e.verifyMFA(t, e.challenge(t, u), codes[0]); w.Code != http.StatusOK {
+		t.Fatalf("an old code should still work: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMatchTOTPStep(t *testing.T) {
+	const secret = "JBSWY3DPEHPK3PXP"
+	now := time.Unix(1700000010, 0)
+	step := now.Unix() / totpPeriod
+	cases := []struct {
+		name string
+		at   time.Time
+		want int64
+		ok   bool
+	}{
+		{"this step", now, step, true},
+		{"one step back", now.Add(-totpPeriod * time.Second), step - 1, true},
+		{"one step ahead", now.Add(totpPeriod * time.Second), step + 1, true},
+		{"two steps back", now.Add(-2 * totpPeriod * time.Second), 0, false},
+		{"two steps ahead", now.Add(2 * totpPeriod * time.Second), 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := matchTOTPStep(secret, totpAt(t, secret, tc.at), now)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("%s: step %d ok %v, want %d %v", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+	if _, ok := matchTOTPStep(secret, "not-a-code", now); ok {
+		t.Error("garbage matched")
+	}
+}
+
+func TestCodeUsedAtEnrollmentCannotSignIn(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	access := e.login(t, u).AccessToken
+	secret := decodeData[EnrollStartResponse](t, e.enrollStart(t, access)).Secret
+	code := totpNow(t, secret)
+	if w := e.request(http.MethodPost, "/v1/auth/mfa/enroll/confirm", access, mustJSON(t, MFACodeRequest{Code: code})); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	var after user.User
+	if err := e.db.First(&after, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.TOTPLastStep == nil {
+		t.Fatal("enrollment did not record the step")
+	}
+	w := e.verifyMFA(t, e.challenge(t, u), code)
+	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "invalid_code" {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTOTPCodeCannotBeReplayed(t *testing.T) {
+	e := newEnv(t)
+	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
+	code := e.code(t, secret)
+	if w := e.verifyMFA(t, e.challenge(t, u), code); w.Code != http.StatusOK {
+		t.Fatalf("first use: %d %s", w.Code, w.Body.String())
+	}
+	token := e.challenge(t, u)
+	w := e.verifyMFA(t, token, code)
+	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "invalid_code" {
+		t.Fatalf("replay: %d %s", w.Code, w.Body.String())
+	}
+	if n := e.countEvents(t, audit.EventMFAFailed); n != 1 {
+		t.Fatalf("%d failed events", n)
+	}
+	// A refused replay does not spend the challenge: the next step's code still works.
+	if w := e.verifyMFA(t, token, totpAt(t, secret, time.Now().Add(totpPeriod*time.Second))); w.Code != http.StatusOK {
+		t.Fatalf("a later code: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A step can never go backwards, so a code from before the last accepted one is refused
+// even though it is still inside the skew window and has never been used.
+func TestEarlierStepIsRefusedAfterALaterOne(t *testing.T) {
+	e := newEnv(t)
+	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
+	if err := e.db.Exec(`UPDATE users SET totp_last_step = NULL`).Error; err != nil {
+		t.Fatal(err)
+	}
+	later := totpAt(t, secret, time.Now().Add(totpPeriod*time.Second))
+	if w := e.verifyMFA(t, e.challenge(t, u), later); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if w := e.verifyMFA(t, e.challenge(t, u), totpNow(t, secret)); w.Code != http.StatusUnauthorized {
+		t.Fatalf("an earlier step: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestStepUpCodeCannotBeReplayed(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	access := e.login(t, u).AccessToken
+	secret, _ := e.enroll(t, access)
+	code := e.code(t, secret)
+	if w := e.regenerate(t, access, testPassword, code); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if w := e.regenerate(t, access, testPassword, code); w.Code != http.StatusForbidden {
+		t.Fatalf("replay: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNewChallengeRetiresTheOldOne(t *testing.T) {
+	e := newEnv(t)
+	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
+	old := e.challenge(t, u)
+	current := e.challenge(t, u)
+	w := e.verifyMFA(t, old, e.code(t, secret))
+	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "mfa_session_expired" {
+		t.Fatalf("old challenge: %d %s", w.Code, w.Body.String())
+	}
+	if w := e.verifyMFA(t, current, e.code(t, secret)); w.Code != http.StatusOK {
+		t.Fatalf("current challenge: %d %s", w.Code, w.Body.String())
+	}
+	var live int64
+	if err := e.db.Model(&mfa.Challenge{}).Where("user_id = ? AND consumed_at IS NULL", u.ID).Count(&live).Error; err != nil {
+		t.Fatal(err)
+	}
+	if live != 0 {
+		t.Fatalf("%d live challenges", live)
+	}
+}
+
+// Parallel guesses must not all pass a check made before any of them is counted.
+func TestParallelBadCodesStayWithinTheThreshold(t *testing.T) {
+	e := newEnv(t, func(d *Deps) { d.Cfg.MFA.MaxAttempts = 100 }) // the account limit is under test
+	u, _, _ := e.enrolledUser(t, entities.RoleUser)
+	token := e.challenge(t, u)
+
+	const n = 12
+	var checked, locked atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			switch w := e.verifyMFA(t, token, "000000"); errorCode(t, w) {
+			case "invalid_code":
+				checked.Add(1)
+			case "account_locked":
+				locked.Add(1)
+			default:
+				t.Errorf("%d %s", w.Code, w.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	if checked.Load() != testLockoutThreshold || locked.Load() != n-testLockoutThreshold {
+		t.Fatalf("%d codes checked and %d refused, with a threshold of %d", checked.Load(), locked.Load(), testLockoutThreshold)
+	}
+}
+
+func TestParallelBadPasswordsStayWithinTheThreshold(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	const n = 12
+	var checked atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if w := e.loginWith(t, u.Email, "not-the-password"); w.Code == http.StatusUnauthorized {
+				checked.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if checked.Load() != testLockoutThreshold {
+		t.Fatalf("%d passwords checked, with a threshold of %d", checked.Load(), testLockoutThreshold)
+	}
+}
+
+// A good password gives its attempt back, so signing in does not itself burn the count.
+func TestCorrectPasswordDoesNotCountAgainstAnEnrolledUser(t *testing.T) {
+	e := newEnv(t)
+	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
+	for i := 0; i < 6; i++ {
+		e.challenge(t, u)
+	}
+	if w := e.verifyMFA(t, e.challenge(t, u), e.code(t, secret)); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -227,7 +558,7 @@ func TestLoginWithMFA(t *testing.T) {
 	}
 	token := decodeData[MFAChallengeResponse](t, w).MFAToken
 
-	w = e.verifyMFA(t, token, totpNow(t, secret))
+	w = e.verifyMFA(t, token, e.code(t, secret))
 	if w.Code != http.StatusOK {
 		t.Fatalf("verify: %d %s", w.Code, w.Body.String())
 	}
@@ -263,10 +594,10 @@ func TestChallengeIsSingleUse(t *testing.T) {
 	e := newEnv(t)
 	u, secret, _ := e.enrolledUser(t, entities.RoleUser)
 	token := e.challenge(t, u)
-	if w := e.verifyMFA(t, token, totpNow(t, secret)); w.Code != http.StatusOK {
+	if w := e.verifyMFA(t, token, e.code(t, secret)); w.Code != http.StatusOK {
 		t.Fatalf("%d", w.Code)
 	}
-	w := e.verifyMFA(t, token, totpNow(t, secret))
+	w := e.verifyMFA(t, token, e.code(t, secret))
 	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "mfa_session_expired" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -280,7 +611,7 @@ func TestConcurrentVerificationsYieldOneSession(t *testing.T) {
 	if err := e.db.Model(&session.Session{}).Count(&before).Error; err != nil {
 		t.Fatal(err)
 	}
-	code := totpNow(t, secret)
+	code := e.code(t, secret)
 
 	const n = 5
 	codes := make([]int, n)
@@ -317,7 +648,7 @@ func TestChallengeExpires(t *testing.T) {
 		Update("expires_at", time.Now().UTC().Add(-time.Minute)).Error; err != nil {
 		t.Fatal(err)
 	}
-	if w := e.verifyMFA(t, token, totpNow(t, secret)); w.Code != http.StatusUnauthorized {
+	if w := e.verifyMFA(t, token, e.code(t, secret)); w.Code != http.StatusUnauthorized {
 		t.Fatalf("%d", w.Code)
 	}
 }
@@ -334,7 +665,7 @@ func TestChallengeAttemptsAreCapped(t *testing.T) {
 			t.Fatalf("attempt %d: %d %s", i, w.Code, w.Body.String())
 		}
 	}
-	w := e.verifyMFA(t, token, totpNow(t, secret))
+	w := e.verifyMFA(t, token, e.code(t, secret))
 	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "mfa_session_expired" {
 		t.Fatalf("the right code after the cap: %d %s", w.Code, w.Body.String())
 	}
@@ -360,7 +691,7 @@ func TestPassingMFAClearsTheFailureCount(t *testing.T) {
 	for round := 0; round < 3; round++ {
 		e.verifyMFA(t, e.challenge(t, u), "000000")
 		e.verifyMFA(t, e.challenge(t, u), "000000")
-		if w := e.verifyMFA(t, e.challenge(t, u), totpNow(t, secret)); w.Code != http.StatusOK {
+		if w := e.verifyMFA(t, e.challenge(t, u), e.code(t, secret)); w.Code != http.StatusOK {
 			t.Fatalf("round %d: %d %s", round, w.Code, w.Body.String())
 		}
 	}
@@ -390,32 +721,35 @@ func TestBackupCodeIsSingleUse(t *testing.T) {
 	}
 }
 
+// Driven at the service, because a user only ever has one live challenge, and that alone
+// would serialize these before the code's own compare-and-set was reached.
 func TestConcurrentUseOfABackupCodeHasOneWinner(t *testing.T) {
-	e := newEnv(t, func(d *Deps) { d.Cfg.AuthSecurity.LockoutThreshold = 0 })
+	e := newEnv(t)
+	svc := NewService(e.deps)
 	u, _, codes := e.enrolledUser(t, entities.RoleUser)
 	const n = 5
-	tokens := make([]string, n)
-	for i := range tokens {
-		tokens[i] = e.challenge(t, u)
-	}
-	results := make([]int, n)
+	wins := make([]bool, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = e.verifyMFA(t, tokens[i], codes[1]).Code
+			ok, err := svc.consumeBackupCode(context.Background(), u.ID, codes[1])
+			if err != nil {
+				t.Error(err)
+			}
+			wins[i] = ok
 		}()
 	}
 	wg.Wait()
-	wins := 0
-	for _, c := range results {
-		if c == http.StatusOK {
-			wins++
+	won := 0
+	for _, ok := range wins {
+		if ok {
+			won++
 		}
 	}
-	if wins != 1 {
-		t.Fatalf("%d wins in %v", wins, results)
+	if won != 1 {
+		t.Fatalf("%d wins", won)
 	}
 }
 
@@ -468,7 +802,7 @@ func TestStatusAndRegenerate(t *testing.T) {
 	if s := status(tokens.AccessToken); s.Enabled || s.BackupCodesRemaining != 0 {
 		t.Fatalf("%+v", s)
 	}
-	if w := e.request(http.MethodPost, "/v1/auth/mfa/backup-codes/regenerate", tokens.AccessToken, mustJSON(t, MFACodeRequest{Code: "000000"})); w.Code != http.StatusBadRequest {
+	if w := e.regenerate(t, tokens.AccessToken, testPassword, "000000"); w.Code != http.StatusBadRequest {
 		t.Fatalf("not enrolled: %d", w.Code)
 	}
 
@@ -483,10 +817,10 @@ func TestStatusAndRegenerate(t *testing.T) {
 	}
 
 	// A stolen access token alone must not be able to mint a permanent second factor.
-	if w := e.request(http.MethodPost, "/v1/auth/mfa/backup-codes/regenerate", tokens.AccessToken, mustJSON(t, MFACodeRequest{Code: "000000"})); w.Code != http.StatusForbidden {
+	if w := e.regenerate(t, tokens.AccessToken, testPassword, "000000"); w.Code != http.StatusForbidden {
 		t.Fatalf("wrong code: %d", w.Code)
 	}
-	w := e.request(http.MethodPost, "/v1/auth/mfa/backup-codes/regenerate", tokens.AccessToken, mustJSON(t, MFACodeRequest{Code: totpNow(t, secret)}))
+	w := e.regenerate(t, tokens.AccessToken, testPassword, e.code(t, secret))
 	if w.Code != http.StatusOK {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -543,7 +877,7 @@ func TestGoogleLoginStillNeedsTheSecondFactor(t *testing.T) {
 	if resp != nil || challenge == nil {
 		t.Fatalf("google alone yielded a session: %+v", resp)
 	}
-	w := e.verifyMFA(t, challenge.MFAToken, totpNow(t, secret))
+	w := e.verifyMFA(t, challenge.MFAToken, e.code(t, secret))
 	if w.Code != http.StatusOK {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -568,7 +902,7 @@ func TestAdminResetClearsTheTargetsSecondFactor(t *testing.T) {
 	targetSession := e.verifyMFA(t, e.challenge(t, target), codes[0])
 	targetTokens := decodeData[AuthResponse](t, targetSession).Tokens
 
-	w := e.adminReset(t, adminTokens.AccessToken, target.UUID.String(), totpNow(t, adminSecret))
+	w := e.adminReset(t, adminTokens.AccessToken, target.UUID.String(), e.code(t, adminSecret))
 	if w.Code != http.StatusOK {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
@@ -621,7 +955,7 @@ func TestAdminResetMFARefusals(t *testing.T) {
 	if w := e.adminReset(t, adminTokens.AccessToken, target.UUID.String(), "000000"); w.Code != http.StatusForbidden {
 		t.Fatalf("wrong step-up code: %d", w.Code)
 	}
-	if w := e.adminReset(t, adminTokens.AccessToken, uuidMissing, totpNow(t, secret)); w.Code != http.StatusNotFound {
+	if w := e.adminReset(t, adminTokens.AccessToken, uuidMissing, e.code(t, secret)); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown target: %d", w.Code)
 	}
 
@@ -648,7 +982,7 @@ func TestBackupCodesWorkWhenTheSecretCannotBeDecrypted(t *testing.T) {
 	if err := e.db.Model(u).Update("totp_secret_enc", "not-a-valid-ciphertext").Error; err != nil {
 		t.Fatal(err)
 	}
-	if w := e.verifyMFA(t, e.challenge(t, u), totpNow(t, secret)); w.Code != http.StatusUnauthorized {
+	if w := e.verifyMFA(t, e.challenge(t, u), e.code(t, secret)); w.Code != http.StatusUnauthorized {
 		t.Fatalf("%d", w.Code)
 	}
 	if w := e.verifyMFA(t, e.challenge(t, u), codes[0]); w.Code != http.StatusOK {

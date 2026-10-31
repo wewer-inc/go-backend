@@ -179,7 +179,7 @@ All auth responses return:
 
 Pass `Authorization: Bearer <access_token>` on secured routes.
 
-On an account with two-factor authentication on, `login` and the Google callback answer with `{"status": "mfa_required", "mfa_token": "...", "expires_at": "..."}` instead of tokens. Post the token with a TOTP or backup code to `/v1/auth/mfa/verify` to get the usual response. Turning MFA on requires `MFA_ENCRYPTION_KEY`.
+On an account with two-factor authentication on, `login` and the Google callback answer with `{"status": "mfa_required", "mfa_token": "...", "expires_at": "..."}` instead of tokens. Post the token with a TOTP or backup code to `/v1/auth/mfa/verify` to get the usual response. Each TOTP code works once. Turning MFA on requires `MFA_ENCRYPTION_KEY`, and it and regenerating backup codes both require `current_password`. An account with no password, which signs in with Google, must have signed in within the last 5 minutes instead, or gets `403 reauthentication_required`. Both changes email the user.
 
 ## Admin endpoints
 

@@ -106,6 +106,23 @@ func (s *Service) storeNewPassword(ctx context.Context, u *user.User, newHash st
 	return nil
 }
 
+// checkCurrentPassword confirms the caller knows the account's password. Guessing it
+// through a stolen access token counts like guessing it at the login form.
+func (s *Service) checkCurrentPassword(ctx context.Context, u *user.User, password string) error {
+	if password == "" {
+		return apierr.FieldRequired("current_password", "current password is required")
+	}
+	if err := s.reserveAttempt(ctx, u.Email); err != nil {
+		return err
+	}
+	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
+		// A 400, not a 401: the session is fine, and clients treat a 401 as signed out.
+		return apierr.BadRequest("current_password_incorrect", "current password is incorrect")
+	}
+	s.releaseAttempt(ctx, u.Email)
+	return nil
+}
+
 // ChangePassword checks the current password, stores the new one and ends every session
 // except the one making the request.
 func (s *Service) ChangePassword(ctx context.Context, userID uint, currentSID string, req ChangePasswordRequest, ip string) error {
@@ -121,19 +138,8 @@ func (s *Service) ChangePassword(ctx context.Context, userID uint, currentSID st
 		return apierr.Unauthorized("invalid session")
 	}
 
-	// Guessing the current password through a stolen access token counts like guessing it
-	// at the login form.
-	remaining, err := s.lockout.retryAfter(ctx, u.Email)
-	if err != nil {
-		return apierr.InternalErr(err, "lockout check failed")
-	}
-	if remaining > 0 {
-		return lockedError(remaining)
-	}
-	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.CurrentPassword)) != nil {
-		s.countFailure(ctx, u.Email)
-		// A 400, not a 401: the session is fine, and clients treat a 401 as signed out.
-		return apierr.BadRequest("current_password_incorrect", "current password is incorrect")
+	if err := s.checkCurrentPassword(ctx, u, req.CurrentPassword); err != nil {
+		return err
 	}
 
 	newHash, err := s.checkNewPassword(ctx, u, req.NewPassword)
@@ -320,29 +326,25 @@ func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest, l
 	return nil
 }
 
-// mailPasswordChanged tells the user, so a change they did not make gets noticed. Sent
-// from the worker: a slow mail server must not hold up the request, and a failed send
-// must not undo a password change that already committed.
 func (s *Service) mailPasswordChanged(u *user.User) {
+	s.mailNotice(u.Email, "Your password was changed",
+		`<p>The password for this account was just changed, and other devices were signed out.</p>`+
+			`<p>If this was not you, reset your password now.</p>`)
+}
+
+// mailNotice tells the user about a security change, so one they did not make gets
+// noticed. Sent from the worker: a slow mail server must not hold up the request, and a
+// failed send must not undo a change that already committed.
+func (s *Service) mailNotice(to, subject, body string) {
 	s.enqueue(func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, jobTimeout)
 		defer cancel()
-		return s.mailer.Send(ctx, u.Email, "Your password was changed",
-			`<p>The password for this account was just changed, and other devices were signed out.</p>`+
-				`<p>If this was not you, reset your password now.</p>`)
+		return s.mailer.Send(ctx, to, subject, body)
 	})
 }
 
 func (s *Service) enqueue(job worker.Job) {
 	if err := s.jobs.Enqueue(job); err != nil {
 		s.log.Warn().Err(err).Msg("auth: background job dropped")
-	}
-}
-
-// countFailure records a failed credential check. A write failure is logged rather than
-// returned: the caller is already answering with a refusal.
-func (s *Service) countFailure(ctx context.Context, email string) {
-	if err := s.lockout.fail(ctx, email); err != nil {
-		s.log.Error().Err(err).Msg("auth: failed to count a login failure")
 	}
 }

@@ -24,6 +24,8 @@ type User struct {
 	MFAEnrolledAt       *time.Time `gorm:"column:mfa_enrolled_at"                  json:"-"`
 	MFAPendingSecretEnc string     `gorm:"column:mfa_pending_secret_enc;type:text" json:"-"`
 	MFAPendingAt        *time.Time `gorm:"column:mfa_pending_at"                   json:"-"`
+	// TOTPLastStep is the last accepted time step, so a code cannot be used twice.
+	TOTPLastStep *int64 `gorm:"column:totp_last_step" json:"-"`
 }
 
 func (User) TableName() string { return "users" }

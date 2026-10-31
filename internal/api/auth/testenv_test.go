@@ -40,10 +40,11 @@ const (
 	raceWindow    = 30 * time.Second
 	lockoutWindow = 15 * time.Minute
 
-	testMFAKey          = "test-mfa-key-test-mfa-key-test-mfa-key"
-	testMFAMaxAttempts  = 5
-	backupCodeTestCount = 4
-	uuidMissing         = "00000000-0000-4000-8000-000000000000"
+	testMFAKey           = "test-mfa-key-test-mfa-key-test-mfa-key"
+	testMFAMaxAttempts   = 5
+	testLockoutThreshold = 3
+	backupCodeTestCount  = 4
+	uuidMissing          = "00000000-0000-4000-8000-000000000000"
 )
 
 type testEnv struct {
@@ -103,7 +104,7 @@ func testConfig() config.Config {
 		AuthSecurity: config.AuthSecurityConfig{
 			SessionAbsoluteTTL:   24 * time.Hour,
 			RefreshRaceWindow:    raceWindow,
-			LockoutThreshold:     3,
+			LockoutThreshold:     testLockoutThreshold,
 			LockoutWindow:        lockoutWindow,
 			PasswordResetTTL:     time.Hour,
 			PasswordHistoryCount: 2,
@@ -136,7 +137,8 @@ func openTestDB(t *testing.T) *gorm.DB {
 		id integer primary key, created_at datetime, updated_at datetime, deleted_at datetime,
 		uuid text, email text collate nocase unique, password_hash text, name text,
 		platform_role text default 'user', google_id text, avatar_url text,
-		totp_secret_enc text, mfa_enrolled_at datetime, mfa_pending_secret_enc text, mfa_pending_at datetime)`).Error; err != nil {
+		totp_secret_enc text, mfa_enrolled_at datetime, mfa_pending_secret_enc text, mfa_pending_at datetime,
+		totp_last_step integer)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(

@@ -112,5 +112,14 @@ func migrations() []*gormigrate.Migration {
 				return tx.Migrator().DropTable(&mfa.BackupCode{}, &mfa.Challenge{})
 			},
 		},
+		{
+			ID: "0008_totp_last_step",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step bigint`).Error
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return tx.Exec(`ALTER TABLE users DROP COLUMN IF EXISTS totp_last_step`).Error
+			},
+		},
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base32"
 	"encoding/base64"
 	"errors"
@@ -22,8 +23,10 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/sessions"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/google/uuid"
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // statusMFARequired is the status on a challenge response.
@@ -32,6 +35,13 @@ const statusMFARequired = "mfa_required"
 // backupCodeBytes is 80 bits. Backup codes are hashed with fast SHA-256, so they need
 // enough entropy that a leaked table cannot be brute forced.
 const backupCodeBytes = 10
+
+// totpPeriod is the length of a TOTP time step, in seconds.
+const totpPeriod = 30
+
+// reauthWindow is how recently an account with no password must have signed in to make a
+// change that would otherwise need its password.
+const reauthWindow = 5 * time.Minute
 
 var errInvalidCode = errors.New("auth: invalid mfa code")
 
@@ -42,34 +52,101 @@ func (s *Service) mfaAvailable() error {
 	return nil
 }
 
-// totpValid checks a code against the user's stored secret. An undecryptable secret is
+// matchTOTPStep finds the time step a code belongs to, within one step either side of now
+// for clock drift. A plain validity check is not enough: refusing a replay needs to know
+// which step was used.
+func matchTOTPStep(secret, code string, now time.Time) (int64, bool) {
+	code = strings.TrimSpace(code)
+	var step int64
+	found := false
+	// Every candidate is compared, newest last. In the rare case one code fits two steps,
+	// the newest is the one that does not falsely read as a replay.
+	for offset := -1; offset <= 1; offset++ {
+		at := now.Add(time.Duration(offset) * totpPeriod * time.Second)
+		want, err := totp.GenerateCodeCustom(secret, at, totp.ValidateOpts{
+			Period: totpPeriod, Skew: 1, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+		})
+		if err != nil {
+			return 0, false
+		}
+		if subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 {
+			step = at.Unix() / totpPeriod
+			found = true
+		}
+	}
+	return step, found
+}
+
+// totpStep matches a code against the user's stored secret. An undecryptable secret is
 // logged and reads as a wrong code: backup codes still work, and the account is not locked
 // out of them by a rotated key.
-func (s *Service) totpValid(u *user.User, code string) bool {
+func (s *Service) totpStep(u *user.User, code string) (int64, bool) {
 	if u.TOTPSecretEnc == "" || s.mfaKey == nil {
-		return false
+		return 0, false
 	}
 	secret, err := appcrypto.Decrypt(s.mfaKey, u.TOTPSecretEnc)
 	if err != nil {
 		s.log.Error().Err(err).Uint("user_id", u.ID).Msg("auth: could not decrypt a totp secret")
-		return false
+		return 0, false
 	}
-	return totp.Validate(code, secret)
+	return matchTOTPStep(secret, code, time.Now())
 }
 
-// startChallenge creates the challenge an enrolled user must pass to get a session.
+// consumeTOTPStep advances the user's last accepted step. A TOTP code is otherwise good
+// for its whole window, so one seen over a shoulder could be used again. The compare-and-set
+// means that of two requests with one code, only one matches a row, and a code from a step
+// at or before the stored one matches none.
+func (s *Service) consumeTOTPStep(ctx context.Context, userID uint, step int64) (bool, error) {
+	return s.userRepo.UpdateColumnsGuarded(ctx, userID, nil,
+		[]store.Clause{{Expr: "totp_last_step IS NULL OR totp_last_step < ?", Args: []any{step}}},
+		map[string]any{"totp_last_step": step})
+}
+
+// checkIdentity is the re-authentication in front of changes that would let a stolen
+// session keep the account: the current password, or, for an account that has none, a
+// session signed in moments ago. Refreshing does not make a session recent, so a stolen one
+// cannot refresh its way past this.
+func (s *Service) checkIdentity(ctx context.Context, u *user.User, sid, password string) error {
+	if u.PasswordHash != "" {
+		return s.checkCurrentPassword(ctx, u, password)
+	}
+	sess, err := s.sessionByUUID(ctx, sid)
+	if err != nil {
+		return apierr.InternalErr(err, "session lookup failed")
+	}
+	if time.Since(sess.CreatedAt) > reauthWindow {
+		return apierr.ForbiddenCode("reauthentication_required", "sign in again to make this change")
+	}
+	return nil
+}
+
+// startChallenge creates the challenge an enrolled user must pass to get a session, and
+// retires any earlier one, so a user has at most one live. The row lock keeps that true
+// when two sign-ins start at once: otherwise neither would see the other's new challenge.
 func (s *Service) startChallenge(ctx context.Context, u *user.User, method session.LoginMethod) (*MFAChallengeResponse, error) {
 	raw, err := platformauth.GenerateOpaqueToken()
 	if err != nil {
 		return nil, apierr.InternalErr(err, "failed to start mfa")
 	}
 	expires := time.Now().UTC().Add(s.challengeTTL)
-	if err := s.challengeRepo.Create(ctx, &mfa.Challenge{
-		UserID:    u.ID,
-		TokenHash: platformauth.HashToken(raw),
-		Method:    method,
-		ExpiresAt: expires,
-	}); err != nil {
+	err = store.WithTx(ctx, s.db, func(ctx context.Context, tx *gorm.DB) error {
+		var locked user.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").Take(&locked, u.ID).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&mfa.Challenge{}).
+			Where("user_id = ? AND consumed_at IS NULL", u.ID).
+			Update("consumed_at", time.Now().UTC()).Error; err != nil {
+			return err
+		}
+		return s.challengeRepo.Create(ctx, &mfa.Challenge{
+			UserID:    u.ID,
+			TokenHash: platformauth.HashToken(raw),
+			Method:    method,
+			ExpiresAt: expires,
+		})
+	})
+	if err != nil {
 		return nil, apierr.InternalErr(err, "failed to start mfa")
 	}
 	return &MFAChallengeResponse{Status: statusMFARequired, MFAToken: raw, ExpiresAt: expires}, nil
@@ -107,15 +184,11 @@ func (s *Service) VerifyMFA(ctx context.Context, req MFAVerifyRequest, lc LoginC
 	if err != nil {
 		return nil, expired
 	}
-	remaining, err := s.lockout.retryAfter(ctx, u.Email)
-	if err != nil {
-		return nil, apierr.InternalErr(err, "lockout check failed")
-	}
-	if remaining > 0 {
-		return nil, lockedError(remaining)
+	if err := s.reserveAttempt(ctx, u.Email); err != nil {
+		return nil, err
 	}
 
-	usedTOTP := s.totpValid(u, req.Code)
+	step, usedTOTP := s.totpStep(u, req.Code)
 	usedBackup := false
 	err = store.WithTx(ctx, s.db, func(ctx context.Context, _ *gorm.DB) error {
 		// Claimed first, so one challenge yields one session however many valid codes race.
@@ -128,6 +201,13 @@ func (s *Service) VerifyMFA(ctx context.Context, req MFAVerifyRequest, lc LoginC
 			return errChallengeSpent
 		}
 		if usedTOTP {
+			fresh, err := s.consumeTOTPStep(ctx, u.ID, step)
+			if err != nil {
+				return err
+			}
+			if !fresh {
+				return errInvalidCode // a replay; rolling back leaves the challenge usable
+			}
 			return nil
 		}
 		usedBackup, err = s.consumeBackupCode(ctx, u.ID, req.Code)
@@ -141,7 +221,6 @@ func (s *Service) VerifyMFA(ctx context.Context, req MFAVerifyRequest, lc LoginC
 	})
 	switch {
 	case errors.Is(err, errInvalidCode):
-		s.countFailure(ctx, u.Email)
 		s.record(ctx, audit.EventMFAFailed, &u.ID, lc.IP, nil)
 		return nil, apierr.UnauthorizedCode("invalid_code", "that code is not valid")
 	case errors.Is(err, errChallengeSpent):
@@ -150,9 +229,7 @@ func (s *Service) VerifyMFA(ctx context.Context, req MFAVerifyRequest, lc LoginC
 		return nil, apierr.InternalErr(err, "mfa verification failed")
 	}
 
-	if err := s.lockout.clear(ctx, u.Email); err != nil {
-		s.log.Error().Err(err).Msg("auth: failed to clear the login failure count")
-	}
+	s.clearAttempts(ctx, u.Email)
 	s.record(ctx, audit.EventMFAVerified, &u.ID, lc.IP, nil)
 	if usedBackup {
 		s.record(ctx, audit.EventMFABackupUsed, &u.ID, lc.IP, nil)
@@ -163,8 +240,10 @@ func (s *Service) VerifyMFA(ctx context.Context, req MFAVerifyRequest, lc LoginC
 var errChallengeSpent = errors.New("auth: mfa challenge already spent")
 
 // StartEnrollment generates a secret and holds it, encrypted, until a code confirms the
-// user's authenticator has it. Calling it again replaces the pending secret.
-func (s *Service) StartEnrollment(ctx context.Context, userID uint) (*EnrollStartResponse, error) {
+// user's authenticator has it. Calling it again replaces the pending secret. It needs
+// re-authentication: otherwise a stolen session could put the thief's device on the account
+// and, by signing out other sessions, lock the owner out of it.
+func (s *Service) StartEnrollment(ctx context.Context, userID uint, currentSID, password string) (*EnrollStartResponse, error) {
 	if err := s.mfaAvailable(); err != nil {
 		return nil, err
 	}
@@ -175,8 +254,13 @@ func (s *Service) StartEnrollment(ctx context.Context, userID uint) (*EnrollStar
 	if u.MFAEnrolledAt != nil {
 		return nil, apierr.Conflict("mfa_already_enrolled", "two-factor authentication is already on")
 	}
+	if err := s.checkIdentity(ctx, u, currentSID, password); err != nil {
+		return nil, err
+	}
 
-	key, err := totp.Generate(totp.GenerateOpts{Issuer: s.mfaIssuer, AccountName: u.Email})
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer: s.mfaIssuer, AccountName: u.Email, Period: totpPeriod, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
 	if err != nil {
 		return nil, apierr.InternalErr(err, "failed to generate mfa secret")
 	}
@@ -231,7 +315,8 @@ func (s *Service) ConfirmEnrollment(ctx context.Context, userID uint, currentSID
 	if err != nil {
 		return nil, apierr.InternalErr(err, "failed to read mfa secret")
 	}
-	if !totp.Validate(code, secret) {
+	step, ok := matchTOTPStep(secret, code, time.Now())
+	if !ok {
 		return nil, apierr.BadRequest("invalid_code", "that code is not valid")
 	}
 
@@ -241,6 +326,7 @@ func (s *Service) ConfirmEnrollment(ctx context.Context, userID uint, currentSID
 			map[string]any{"mfa_enrolled_at": nil}, nil,
 			map[string]any{
 				"totp_secret_enc":        u.MFAPendingSecretEnc,
+				"totp_last_step":         step, // the code that proved enrollment is spent
 				"mfa_enrolled_at":        time.Now().UTC(),
 				"mfa_pending_secret_enc": "",
 				"mfa_pending_at":         nil,
@@ -262,6 +348,9 @@ func (s *Service) ConfirmEnrollment(ctx context.Context, userID uint, currentSID
 	if err != nil {
 		return nil, err
 	}
+	s.mailNotice(u.Email, "Two-factor authentication was turned on",
+		`<p>Two-factor authentication was just turned on for this account, and other devices were signed out.</p>`+
+			`<p>If this was not you, contact your administrator now.</p>`)
 	return codes, nil
 }
 
@@ -286,16 +375,19 @@ func (s *Service) Status(ctx context.Context, userID uint) (*MFAStatusResponse, 
 	}, nil
 }
 
-// RegenerateBackupCodes replaces the user's codes. It needs a current TOTP code, because
-// fresh backup codes are a permanent second factor and an access token alone, which could
-// be stolen, should not be enough to mint them.
-func (s *Service) RegenerateBackupCodes(ctx context.Context, userID uint, code, ip string) ([]string, error) {
+// RegenerateBackupCodes issues a new set of codes and voids the old set. The caller must
+// prove their identity again and supply a current TOTP code: backup codes never expire, so
+// a stolen access token on its own must not be able to produce them.
+func (s *Service) RegenerateBackupCodes(ctx context.Context, userID uint, currentSID, password, code, ip string) ([]string, error) {
 	u, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, apierr.InternalErr(err, "user lookup failed")
 	}
 	if u.MFAEnrolledAt == nil {
 		return nil, apierr.BadRequest("mfa_not_enrolled", "two-factor authentication is not on")
+	}
+	if err := s.checkIdentity(ctx, u, currentSID, password); err != nil {
+		return nil, err
 	}
 	if err := s.checkStepUp(ctx, u, code, ip); err != nil {
 		return nil, err
@@ -311,6 +403,9 @@ func (s *Service) RegenerateBackupCodes(ctx context.Context, userID uint, code, 
 	if err != nil {
 		return nil, err
 	}
+	s.mailNotice(u.Email, "Your backup codes were replaced",
+		`<p>New two-factor backup codes were just generated for this account, and the old ones no longer work.</p>`+
+			`<p>If this was not you, contact your administrator now.</p>`)
 	return codes, nil
 }
 
@@ -344,6 +439,7 @@ func (s *Service) AdminResetMFA(ctx context.Context, adminID uint, targetUUID, s
 	err = store.WithTx(ctx, s.db, func(ctx context.Context, tx *gorm.DB) error {
 		if err := s.userRepo.UpdateColumnsByID(ctx, target.ID, map[string]any{
 			"totp_secret_enc":        "",
+			"totp_last_step":         nil,
 			"mfa_enrolled_at":        nil,
 			"mfa_pending_secret_enc": "",
 			"mfa_pending_at":         nil,
@@ -365,31 +461,34 @@ func (s *Service) AdminResetMFA(ctx context.Context, adminID uint, targetUUID, s
 		return err
 	}
 
-	s.enqueue(func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, jobTimeout)
-		defer cancel()
-		return s.mailer.Send(ctx, target.Email, "Two-factor authentication was turned off",
-			`<p>An administrator turned off two-factor authentication on this account and signed it out everywhere.</p>`+
-				`<p>If you did not ask for this, contact your administrator.</p>`)
-	})
+	s.mailNotice(target.Email, "Two-factor authentication was turned off",
+		`<p>An administrator turned off two-factor authentication on this account and signed it out everywhere.</p>`+
+			`<p>If you did not ask for this, contact your administrator.</p>`)
 	return nil
 }
 
-// checkStepUp demands a current TOTP code. Failures count toward lockout, because a
-// stolen access token could otherwise guess at this endpoint unthrottled.
+// checkStepUp demands a current TOTP code, spending it so it cannot be used again. Failures
+// count toward lockout, because a stolen access token could otherwise guess here unthrottled.
 func (s *Service) checkStepUp(ctx context.Context, u *user.User, code, ip string) error {
-	remaining, err := s.lockout.retryAfter(ctx, u.Email)
-	if err != nil {
-		return apierr.InternalErr(err, "lockout check failed")
+	if err := s.reserveAttempt(ctx, u.Email); err != nil {
+		return err
 	}
-	if remaining > 0 {
-		return lockedError(remaining)
-	}
-	if !s.totpValid(u, code) {
-		s.countFailure(ctx, u.Email)
+	refused := func() error {
 		s.record(ctx, audit.EventMFAFailed, &u.ID, ip, map[string]any{"step_up": true})
 		return apierr.ForbiddenCode("step_up_required", "that code is not valid")
 	}
+	step, ok := s.totpStep(u, code)
+	if !ok {
+		return refused()
+	}
+	fresh, err := s.consumeTOTPStep(ctx, u.ID, step)
+	if err != nil {
+		return apierr.InternalErr(err, "failed to record the code")
+	}
+	if !fresh {
+		return refused()
+	}
+	s.releaseAttempt(ctx, u.Email)
 	return nil
 }
 
