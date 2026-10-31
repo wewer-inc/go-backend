@@ -3,6 +3,7 @@ package db
 import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/loginfailure"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/mfa"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/note"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
@@ -83,6 +84,32 @@ func migrations() []*gormigrate.Migration {
 			},
 			Rollback: func(tx *gorm.DB) error {
 				return tx.Migrator().DropTable(&session.RetiredRefreshToken{})
+			},
+		},
+		{
+			ID: "0007_mfa",
+			Migrate: func(tx *gorm.DB) error {
+				if err := tx.AutoMigrate(&mfa.BackupCode{}, &mfa.Challenge{}); err != nil {
+					return err
+				}
+				// 0001 applies whatever the User struct looks like today, so on a new database
+				// these columns are there before this step runs and on an older one they are not.
+				// As SQL with IF NOT EXISTS, the step adds exactly these columns and suits both.
+				return tx.Exec(`ALTER TABLE users
+					ADD COLUMN IF NOT EXISTS totp_secret_enc text,
+					ADD COLUMN IF NOT EXISTS mfa_enrolled_at timestamptz,
+					ADD COLUMN IF NOT EXISTS mfa_pending_secret_enc text,
+					ADD COLUMN IF NOT EXISTS mfa_pending_at timestamptz`).Error
+			},
+			Rollback: func(tx *gorm.DB) error {
+				if err := tx.Exec(`ALTER TABLE users
+					DROP COLUMN IF EXISTS totp_secret_enc,
+					DROP COLUMN IF EXISTS mfa_enrolled_at,
+					DROP COLUMN IF EXISTS mfa_pending_secret_enc,
+					DROP COLUMN IF EXISTS mfa_pending_at`).Error; err != nil {
+					return err
+				}
+				return tx.Migrator().DropTable(&mfa.BackupCode{}, &mfa.Challenge{})
 			},
 		},
 	}

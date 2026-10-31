@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/http/middleware"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/config"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/worker"
@@ -34,7 +36,8 @@ type JobQueue interface {
 // RegisterRoutes wires auth endpoints.
 //   - v1 is the unprotected /v1 group (login/register/refresh need no JWT).
 //   - secured is the authenticated group (UserAuth applied).
-func RegisterRoutes(v1, secured *gin.RouterGroup, d Deps) {
+//   - admin is the /v1/admin group.
+func RegisterRoutes(v1, secured, admin *gin.RouterGroup, d Deps) {
 	svc := NewService(d)
 	h := NewHandler(svc, d.Cfg.Env == "prod")
 
@@ -48,6 +51,7 @@ func RegisterRoutes(v1, secured *gin.RouterGroup, d Deps) {
 		pub.POST("/refresh", h.Refresh)
 		pub.POST("/forgot-password", h.ForgotPassword)
 		pub.POST("/reset-password", h.ResetPassword)
+		pub.POST("/mfa/verify", h.MFAVerify)
 		pub.GET("/google", h.GoogleRedirect)
 		pub.GET("/google/callback", h.GoogleCallback)
 	}
@@ -61,5 +65,11 @@ func RegisterRoutes(v1, secured *gin.RouterGroup, d Deps) {
 		sec.GET("/sessions", h.ListSessions)
 		sec.DELETE("/sessions", h.RevokeOtherSessions)
 		sec.DELETE("/sessions/:sid", h.RevokeSession)
+		sec.POST("/mfa/enroll/start", h.MFAEnrollStart)
+		sec.POST("/mfa/enroll/confirm", h.MFAEnrollConfirm)
+		sec.GET("/mfa/status", h.MFAStatus)
+		sec.POST("/mfa/backup-codes/regenerate", h.MFARegenerateBackupCodes)
 	}
+
+	admin.POST("/users/:uuid/mfa/reset", middleware.RequireCapability(authz.CapUsersMFAReset), h.AdminResetMFA)
 }

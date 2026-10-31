@@ -14,6 +14,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/loginfailure"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/mfa"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
@@ -38,6 +39,11 @@ const (
 	testPassword  = "correct-horse-battery"
 	raceWindow    = 30 * time.Second
 	lockoutWindow = 15 * time.Minute
+
+	testMFAKey          = "test-mfa-key-test-mfa-key-test-mfa-key"
+	testMFAMaxAttempts  = 5
+	backupCodeTestCount = 4
+	uuidMissing         = "00000000-0000-4000-8000-000000000000"
 )
 
 type testEnv struct {
@@ -103,6 +109,14 @@ func testConfig() config.Config {
 			PasswordHistoryCount: 2,
 			PasswordResetURL:     "https://app.example.com/reset-password",
 		},
+		MFA: config.MFAConfig{
+			EncryptionKey:   testMFAKey,
+			Issuer:          "test",
+			EnrollTTL:       15 * time.Minute,
+			ChallengeTTL:    5 * time.Minute,
+			MaxAttempts:     testMFAMaxAttempts,
+			BackupCodeCount: backupCodeTestCount,
+		},
 	}
 }
 
@@ -121,12 +135,14 @@ func openTestDB(t *testing.T) *gorm.DB {
 	if err := db.Exec(`CREATE TABLE users (
 		id integer primary key, created_at datetime, updated_at datetime, deleted_at datetime,
 		uuid text, email text collate nocase unique, password_hash text, name text,
-		platform_role text default 'user', google_id text, avatar_url text)`).Error; err != nil {
+		platform_role text default 'user', google_id text, avatar_url text,
+		totp_secret_enc text, mfa_enrolled_at datetime, mfa_pending_secret_enc text, mfa_pending_at datetime)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(
 		&audit.Log{}, &session.Session{}, &session.RetiredRefreshToken{},
 		&passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{},
+		&mfa.BackupCode{}, &mfa.Challenge{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +181,9 @@ func buildRouter(d Deps) *gin.Engine {
 	v1 := r.Group("/v1")
 	secured := v1.Group("")
 	secured.Use(middleware.UserAuth(verifier, users, sessions, nil, false))
-	RegisterRoutes(v1, secured, d)
+	admin := v1.Group("/admin")
+	admin.Use(middleware.AdminAuth(verifier, users, sessions, nil, false))
+	RegisterRoutes(v1, secured, admin, d)
 	return r
 }
 

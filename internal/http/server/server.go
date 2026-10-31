@@ -137,6 +137,15 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 		secured.Use(rl.Global())
 	}
 
+	// Admin routes: AdminAuth first (sets identity), then the admin bucket so it
+	// is user-keyed.
+	admin := v1.Group("/admin")
+	admin.Use(middleware.AdminAuth(jwtVerifier, userRepo, sessionRepo, rawRedis, failOpen))
+	if rl != nil {
+		admin.Use(rl.Admin())
+	}
+	adminaudit.RegisterRoutes(admin, deps.DB)
+
 	// Auth routes: public endpoints get the strict Auth bucket (IP-keyed) when
 	// Redis exists; the rest are registered on the authenticated group. Sessions
 	// live in Postgres, so these do not depend on Redis being enabled.
@@ -144,7 +153,7 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 	if rl != nil {
 		authLimit = rl.Auth()
 	}
-	apiauth.RegisterRoutes(v1, secured, apiauth.Deps{
+	apiauth.RegisterRoutes(v1, secured, admin, apiauth.Deps{
 		Cfg:       deps.Cfg,
 		DB:        deps.DB,
 		Issuer:    jwtIssuer,
@@ -157,15 +166,6 @@ func NewRouter(deps Deps, build versioning.BuildInfo) (http.Handler, error) {
 	})
 
 	example.RegisterRoutes(secured, deps.DB)
-
-	// Admin routes: AdminAuth first (sets identity), then the admin bucket so it
-	// is user-keyed.
-	admin := v1.Group("/admin")
-	admin.Use(middleware.AdminAuth(jwtVerifier, userRepo, sessionRepo, rawRedis, failOpen))
-	if rl != nil {
-		admin.Use(rl.Admin())
-	}
-	adminaudit.RegisterRoutes(admin, deps.DB)
 
 	return r, nil
 }

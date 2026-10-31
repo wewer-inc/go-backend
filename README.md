@@ -140,6 +140,7 @@ For flows that coordinate multiple repos, send email, or enqueue a job — add a
 | POST   | `/v1/auth/refresh`         | —      |
 | POST   | `/v1/auth/forgot-password` | —      |
 | POST   | `/v1/auth/reset-password`  | —      |
+| POST   | `/v1/auth/mfa/verify`      | —      |
 | GET    | `/v1/auth/google`          | —      |
 | GET    | `/v1/auth/google/callback` | —      |
 | POST   | `/v1/auth/logout`          | Bearer |
@@ -148,6 +149,10 @@ For flows that coordinate multiple repos, send email, or enqueue a job — add a
 | GET    | `/v1/auth/sessions`        | Bearer |
 | DELETE | `/v1/auth/sessions`        | Bearer |
 | DELETE | `/v1/auth/sessions/:sid`   | Bearer |
+| POST   | `/v1/auth/mfa/enroll/start` | Bearer |
+| POST   | `/v1/auth/mfa/enroll/confirm` | Bearer |
+| GET    | `/v1/auth/mfa/status`      | Bearer |
+| POST   | `/v1/auth/mfa/backup-codes/regenerate` | Bearer |
 
 `DELETE /v1/auth/sessions` signs out every session but the current one.
 
@@ -173,12 +178,15 @@ All auth responses return:
 
 Pass `Authorization: Bearer <access_token>` on secured routes.
 
+On an account with two-factor authentication on, `login` and the Google callback answer with `{"status": "mfa_required", "mfa_token": "...", "expires_at": "..."}` instead of tokens. Post the token with a TOTP or backup code to `/v1/auth/mfa/verify` to get the usual response. Turning MFA on requires `MFA_ENCRYPTION_KEY`.
+
 ## Admin endpoints
 
 | Method | Path                   | Gate                        |
 | ------ | ---------------------- | --------------------------- |
 | GET    | `/v1/admin/audit`      | permission `admin.audit:read` |
 | GET    | `/v1/admin/audit/verify` | permission `admin.audit:read` |
+| POST   | `/v1/admin/users/:uuid/mfa/reset` | capability `admin.users.mfa:reset`, plus the admin's own TOTP code |
 
 The audit trail is a hash chain (`internal/platform/auditlog`). On its own it cannot detect tail truncation: deleting the newest rows, or all of them, leaves a valid shorter chain, and the hash is unkeyed, so someone able to rewrite the table can recompute it. To detect those, store `head_id` and `head` from `/verify` somewhere the database's writers cannot modify, and pass them back as `?checkpoint_id=&checkpoint_hash=`. Nothing here exports them for you.
 

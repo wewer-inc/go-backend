@@ -11,17 +11,21 @@ const (
 	CapUsersRoleUpdate Capability = "admin.users.role:update"
 	// CapUsersImpersonate lets an admin open a session as another user ("login as").
 	CapUsersImpersonate Capability = "admin.users:impersonate"
+	// CapUsersMFAReset clears another user's second factor. Separate from admin.users:update
+	// because stripping someone's MFA is a step toward taking over their account.
+	CapUsersMFAReset Capability = "admin.users.mfa:reset"
 )
 
 // AllCapabilities is the full list of capabilities, which the completeness tests walk.
 func AllCapabilities() []Capability {
-	return []Capability{CapUsersRoleUpdate, CapUsersImpersonate}
+	return []Capability{CapUsersRoleUpdate, CapUsersImpersonate, CapUsersMFAReset}
 }
 
 // capabilities maps each capability to the roles holding it. An absent role does not.
 var capabilities = map[Capability]map[entities.Role]struct{}{
 	CapUsersRoleUpdate:  {entities.RoleAdmin: {}},
 	CapUsersImpersonate: {entities.RoleAdmin: {}},
+	CapUsersMFAReset:    {entities.RoleAdmin: {}},
 }
 
 // impersonationBarred is the set of capabilities denied to a "login as" session regardless
@@ -30,6 +34,7 @@ var capabilities = map[Capability]map[entities.Role]struct{}{
 var impersonationBarred = map[Capability]struct{}{
 	CapUsersRoleUpdate:  {},
 	CapUsersImpersonate: {},
+	CapUsersMFAReset:    {},
 }
 
 // ImpersonationBars reports whether c is off limits to a "login as" session.

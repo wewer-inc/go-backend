@@ -181,7 +181,7 @@ func TestEscalationGuardCatchesAnUnsafeAuthoredDelegation(t *testing.T) {
 func TestDecideCapabilityDeniesAllCapabilitiesWhileImpersonating(t *testing.T) {
 	imp := uint(99)
 	s := Subject{UserID: 3, Role: entities.RoleAdmin, Impersonator: &imp}
-	for _, c := range []Capability{CapUsersRoleUpdate, CapUsersImpersonate} {
+	for _, c := range []Capability{CapUsersRoleUpdate, CapUsersImpersonate, CapUsersMFAReset} {
 		if d := DecideCapability(s, c); d.Allowed || d.Reason != ReasonImpersonation {
 			t.Errorf("%s inside login-as: %+v", c, d)
 		}
@@ -204,8 +204,11 @@ func TestServedPermissionsMatchTheMatrix(t *testing.T) {
 	if caps := CapabilitiesFor(entities.RoleUser); len(caps) != 0 {
 		t.Fatalf("user capabilities = %v", caps)
 	}
-	if caps := CapabilitiesFor(entities.RoleAdmin); len(caps) != 2 {
+	if caps := CapabilitiesFor(entities.RoleAdmin); len(caps) != 3 {
 		t.Fatalf("admin capabilities = %v", caps)
+	}
+	if HasCapability(entities.RoleSupport, CapUsersMFAReset) {
+		t.Fatal("support must not be able to strip a user's second factor")
 	}
 	if s := ScopesFor(entities.RoleUser); s[ResNote] != "own" || s[ResAdminUsers] != "none" {
 		t.Fatalf("scopes = %v", s)

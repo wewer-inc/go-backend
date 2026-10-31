@@ -592,9 +592,12 @@ func TestGoogleLoginIssuesASession(t *testing.T) {
 		return &googleUserInfo{ID: "g-1", Email: "g@example.com", Name: "G"}, nil
 	}
 
-	resp, err := svc.GoogleCallback(context.Background(), "code", LoginContext{UserAgent: "ua", IP: "10.0.0.1"})
+	resp, challenge, err := svc.GoogleCallback(context.Background(), "code", LoginContext{UserAgent: "ua", IP: "10.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if challenge != nil {
+		t.Fatal("no MFA is on, so there should be no challenge")
 	}
 	s := e.sessionByRefresh(t, resp.Tokens.RefreshToken)
 	if s.LoginMethod != session.MethodGoogle || s.IP != "10.0.0.1" {

@@ -55,13 +55,106 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.Login(c.Request.Context(), req, loginContext(c))
+	resp, challenge, err := h.svc.Login(c.Request.Context(), req, loginContext(c))
 	if err != nil {
 		respondError(c, err)
 		return
 	}
+	if challenge != nil {
+		c.JSON(http.StatusOK, apicommon.Response[MFAChallengeResponse]{Data: challenge})
+		return
+	}
 
 	c.JSON(http.StatusOK, apicommon.Response[AuthResponse]{Data: resp})
+}
+
+// MFAVerify completes a sign-in that was answered with a challenge.
+func (h *Handler) MFAVerify(c *gin.Context) {
+	var req MFAVerifyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	resp, err := h.svc.VerifyMFA(c.Request.Context(), req, loginContext(c))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[AuthResponse]{Data: resp})
+}
+
+// MFAEnrollStart begins turning MFA on for the caller.
+func (h *Handler) MFAEnrollStart(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	resp, err := h.svc.StartEnrollment(c.Request.Context(), userID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[EnrollStartResponse]{Data: resp})
+}
+
+// MFAEnrollConfirm finishes turning MFA on and serves the backup codes, once.
+func (h *Handler) MFAEnrollConfirm(c *gin.Context) {
+	var req MFACodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	claims, _ := middleware.GetActorClaims(c)
+	codes, err := h.svc.ConfirmEnrollment(c.Request.Context(), userID, claims.SID, req.Code, c.ClientIP())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[BackupCodesResponse]{Data: &BackupCodesResponse{BackupCodes: codes}})
+}
+
+// MFAStatus serves whether MFA is on and how many backup codes are left.
+func (h *Handler) MFAStatus(c *gin.Context) {
+	userID, _ := middleware.GetActorUserID(c)
+	resp, err := h.svc.Status(c.Request.Context(), userID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[MFAStatusResponse]{Data: resp})
+}
+
+// MFARegenerateBackupCodes replaces the caller's backup codes.
+func (h *Handler) MFARegenerateBackupCodes(c *gin.Context) {
+	var req MFACodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	userID, _ := middleware.GetActorUserID(c)
+	codes, err := h.svc.RegenerateBackupCodes(c.Request.Context(), userID, req.Code, c.ClientIP())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[BackupCodesResponse]{Data: &BackupCodesResponse{BackupCodes: codes}})
+}
+
+// AdminResetMFA clears another user's MFA.
+func (h *Handler) AdminResetMFA(c *gin.Context) {
+	var req AdminResetMFARequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apicommon.RespondBindError(c, err)
+		return
+	}
+	s, ok := middleware.GetActorSubject(c)
+	if !ok {
+		respondError(c, apierr.Unauthorized("unauthorized"))
+		return
+	}
+	if err := h.svc.AdminResetMFA(c.Request.Context(), s.UserID, c.Param("uuid"), req.StepUpCode, c.ClientIP()); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, apicommon.Response[any]{Message: "two-factor authentication reset"})
 }
 
 func (h *Handler) Refresh(c *gin.Context) {
@@ -210,9 +303,13 @@ func (h *Handler) GoogleCallback(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.GoogleCallback(c.Request.Context(), code, loginContext(c))
+	resp, challenge, err := h.svc.GoogleCallback(c.Request.Context(), code, loginContext(c))
 	if err != nil {
 		respondError(c, err)
+		return
+	}
+	if challenge != nil {
+		c.JSON(http.StatusOK, apicommon.Response[MFAChallengeResponse]{Data: challenge})
 		return
 	}
 

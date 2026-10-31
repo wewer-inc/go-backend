@@ -48,6 +48,50 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
+// MFAChallengeResponse answers a good first factor on an account with MFA on. It carries
+// no user and no tokens: nothing has been granted yet.
+type MFAChallengeResponse struct {
+	Status    string    `json:"status"`
+	MFAToken  string    `json:"mfa_token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// MFAVerifyRequest completes a challenge with a TOTP or backup code.
+type MFAVerifyRequest struct {
+	MFAToken string `json:"mfa_token" binding:"required"`
+	Code     string `json:"code"      binding:"required,max=32"`
+}
+
+// EnrollStartResponse is what an authenticator app needs. Shown once.
+type EnrollStartResponse struct {
+	Secret     string `json:"secret"`
+	OtpauthURI string `json:"otpauth_uri"`
+	QR         string `json:"qr"` // PNG data URI
+}
+
+// MFACodeRequest carries a TOTP code.
+type MFACodeRequest struct {
+	Code string `json:"code" binding:"required,max=32"`
+}
+
+// BackupCodesResponse carries plaintext codes, which are never available again.
+type BackupCodesResponse struct {
+	BackupCodes []string `json:"backup_codes"`
+}
+
+// MFAStatusResponse is what GET /v1/auth/mfa/status serves.
+type MFAStatusResponse struct {
+	Enabled              bool       `json:"enabled"`
+	EnrolledAt           *time.Time `json:"enrolled_at,omitempty"`
+	BackupCodesRemaining int64      `json:"backup_codes_remaining"`
+	BackupCodesTotal     int        `json:"backup_codes_total"`
+}
+
+// AdminResetMFARequest carries the acting admin's own TOTP code.
+type AdminResetMFARequest struct {
+	StepUpCode string `json:"step_up_code" binding:"required,max=32"`
+}
+
 type TokenPairResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`

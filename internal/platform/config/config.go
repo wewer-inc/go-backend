@@ -54,6 +54,18 @@ type AuthSecurityConfig struct {
 	PasswordHistoryCount int
 }
 
+// MFAConfig holds TOTP settings.
+type MFAConfig struct {
+	// EncryptionKey protects TOTP secrets at rest. With no valid key, enrollment is refused
+	// rather than falling back to plaintext. Changing it strands every enrolled secret.
+	EncryptionKey   string
+	Issuer          string
+	EnrollTTL       time.Duration
+	ChallengeTTL    time.Duration
+	MaxAttempts     int
+	BackupCodeCount int
+}
+
 type GoogleOAuthConfig struct {
 	ClientID     string
 	ClientSecret string
@@ -153,6 +165,9 @@ type Config struct {
 	// --- Session Settings ---
 	AuthSecurity AuthSecurityConfig
 
+	// --- Two-factor Authentication ---
+	MFA MFAConfig
+
 	// --- Redis Settings ---
 	Redis RedisConfig
 
@@ -187,6 +202,7 @@ func Load() Config {
 		Redis:    loadRedis(),
 
 		AuthSecurity: loadAuthSecurity(),
+		MFA:          loadMFA(),
 		RateLimit:    loadRateLimitConfig(),
 		// Fail closed: an unset value means no cross-origin requests are allowed,
 		// rather than silently allowing every origin in production.
@@ -249,6 +265,17 @@ func loadAuthSecurity() AuthSecurityConfig {
 		PasswordResetTTL:      parseDuration("PASSWORD_RESET_TTL", time.Hour),
 		PasswordResetCooldown: parseDuration("PASSWORD_RESET_COOLDOWN", 2*time.Minute),
 		PasswordHistoryCount:  parseInt("PASSWORD_HISTORY_COUNT", 3),
+	}
+}
+
+func loadMFA() MFAConfig {
+	return MFAConfig{
+		EncryptionKey:   os.Getenv("MFA_ENCRYPTION_KEY"),
+		Issuer:          getEnv("MFA_ISSUER", "YOUR_APP_NAME"),
+		EnrollTTL:       parseDuration("MFA_ENROLL_TTL", 15*time.Minute),
+		ChallengeTTL:    parseDuration("MFA_CHALLENGE_TTL", 5*time.Minute),
+		MaxAttempts:     parseInt("MFA_MAX_ATTEMPTS", 5),
+		BackupCodeCount: parseInt("MFA_BACKUP_CODE_COUNT", 10),
 	}
 }
 

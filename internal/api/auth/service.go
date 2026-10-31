@@ -12,12 +12,14 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/apierr"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/audit"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/mfa"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordhistory"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/passwordreset"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	platformauth "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
+	appcrypto "github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/crypto"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/email"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
@@ -75,6 +77,30 @@ type Service struct {
 	resetCooldown time.Duration
 	resetURL      string
 	historyCount  int
+
+	backupRepo     repo.Repo[mfa.BackupCode]
+	challengeRepo  repo.Repo[mfa.Challenge]
+	mfaKey         []byte // nil means MFA cannot be turned on
+	mfaIssuer      string
+	enrollTTL      time.Duration
+	challengeTTL   time.Duration
+	mfaMaxAttempts int
+	backupCount    int
+}
+
+// loadMFAKey returns nil unless a usable key is configured. Enrollment is then refused:
+// there is no plaintext fallback for a TOTP secret.
+func loadMFAKey(secret string, log zerolog.Logger) []byte {
+	if secret == "" {
+		log.Warn().Msg("auth: MFA_ENCRYPTION_KEY is not set; users cannot turn on two-factor authentication")
+		return nil
+	}
+	key, err := appcrypto.DeriveKey(secret)
+	if err != nil {
+		log.Error().Err(err).Msg("auth: MFA_ENCRYPTION_KEY is unusable; users cannot turn on two-factor authentication")
+		return nil
+	}
+	return key
 }
 
 // NewService builds the service. d.Redis may be nil: sessions live in Postgres, and
@@ -118,6 +144,15 @@ func NewService(d Deps) *Service {
 		resetCooldown: d.Cfg.AuthSecurity.PasswordResetCooldown,
 		resetURL:      d.Cfg.AuthSecurity.PasswordResetURL,
 		historyCount:  d.Cfg.AuthSecurity.PasswordHistoryCount,
+
+		backupRepo:     repo.NewGormRepo[mfa.BackupCode](d.DB),
+		challengeRepo:  repo.NewGormRepo[mfa.Challenge](d.DB),
+		mfaKey:         loadMFAKey(d.Cfg.MFA.EncryptionKey, d.Log),
+		mfaIssuer:      d.Cfg.MFA.Issuer,
+		enrollTTL:      d.Cfg.MFA.EnrollTTL,
+		challengeTTL:   d.Cfg.MFA.ChallengeTTL,
+		mfaMaxAttempts: d.Cfg.MFA.MaxAttempts,
+		backupCount:    d.Cfg.MFA.BackupCodeCount,
 	}
 }
 
@@ -157,15 +192,16 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest, lc LoginCon
 	return s.issueSession(ctx, u, session.MethodPassword, lc)
 }
 
-// Login authenticates via email/password and starts a session.
-func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) (*AuthResponse, error) {
+// Login authenticates via email/password. It starts a session, or, on an account with MFA
+// on, returns the challenge that must be passed first.
+func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) (*AuthResponse, *MFAChallengeResponse, error) {
 	remaining, err := s.lockout.retryAfter(ctx, req.Email)
 	if err != nil {
-		return nil, apierr.InternalErr(err, "lockout check failed")
+		return nil, nil, apierr.InternalErr(err, "lockout check failed")
 	}
 	if remaining > 0 {
 		s.record(ctx, audit.EventLoginLocked, nil, lc.IP, nil)
-		return nil, lockedError(remaining)
+		return nil, nil, lockedError(remaining)
 	}
 
 	u, err := s.userRepo.GetOne(ctx, store.QueryOpts{
@@ -173,28 +209,36 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, lc LoginContext) 
 	})
 	if err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, apierr.InternalErr(err, "login lookup failed")
+			return nil, nil, apierr.InternalErr(err, "login lookup failed")
 		}
 		s.countFailure(ctx, req.Email)
 		// The address stays out of the row: people type passwords into the wrong field.
 		s.record(ctx, audit.EventLoginFailure, nil, lc.IP, nil)
-		return nil, apierr.Unauthorized("invalid credentials")
+		return nil, nil, apierr.Unauthorized("invalid credentials")
 	}
 
 	if u.PasswordHash == "" {
-		return nil, apierr.BadRequest("oauth_only", "this account uses Google sign-in")
+		return nil, nil, apierr.BadRequest("oauth_only", "this account uses Google sign-in")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
 		s.countFailure(ctx, req.Email)
 		s.record(ctx, audit.EventLoginFailure, &u.ID, lc.IP, nil)
-		return nil, apierr.Unauthorized("invalid credentials")
+		return nil, nil, apierr.Unauthorized("invalid credentials")
+	}
+
+	// The failure count survives until the second factor passes. Otherwise someone holding
+	// the password could reset it by signing in again, and guess codes without limit.
+	if u.MFAEnrolledAt != nil {
+		challenge, err := s.startChallenge(ctx, u, session.MethodPassword)
+		return nil, challenge, err
 	}
 
 	if err := s.lockout.clear(ctx, req.Email); err != nil {
 		s.log.Error().Err(err).Msg("auth: failed to clear the login failure count")
 	}
-	return s.issueSession(ctx, u, session.MethodPassword, lc)
+	resp, err := s.issueSession(ctx, u, session.MethodPassword, lc)
+	return resp, nil, err
 }
 
 // issueSession creates a session and the token pair for it.
@@ -423,27 +467,34 @@ func (s *Service) GoogleAuthURL(state string) (string, error) {
 	return s.googleOAuth.AuthCodeURL(state, oauth2.AccessTypeOffline), nil
 }
 
-// GoogleCallback exchanges an auth code for user info and upserts the user.
-func (s *Service) GoogleCallback(ctx context.Context, code string, lc LoginContext) (*AuthResponse, error) {
+// GoogleCallback exchanges an auth code for user info and upserts the user. Google is the
+// first factor only: an account with MFA on still gets a challenge, or turning MFA on would
+// protect nothing against a compromised Google account.
+func (s *Service) GoogleCallback(ctx context.Context, code string, lc LoginContext) (*AuthResponse, *MFAChallengeResponse, error) {
 	if s.googleOAuth == nil {
-		return nil, apierr.Internal("google oauth not configured")
+		return nil, nil, apierr.Internal("google oauth not configured")
 	}
 
 	token, err := s.googleOAuth.Exchange(ctx, code)
 	if err != nil {
-		return nil, apierr.BadRequest("google_exchange_failed", "could not exchange code")
+		return nil, nil, apierr.BadRequest("google_exchange_failed", "could not exchange code")
 	}
 
 	info, err := s.fetchGoogleUser(ctx, s.googleOAuth.Client(ctx, token))
 	if err != nil {
-		return nil, apierr.Internal("could not fetch google user info")
+		return nil, nil, apierr.Internal("could not fetch google user info")
 	}
 
 	u, err := s.upsertGoogleUser(ctx, info)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return s.issueSession(ctx, u, session.MethodGoogle, lc)
+	if u.MFAEnrolledAt != nil {
+		challenge, err := s.startChallenge(ctx, u, session.MethodGoogle)
+		return nil, challenge, err
+	}
+	resp, err := s.issueSession(ctx, u, session.MethodGoogle, lc)
+	return resp, nil, err
 }
 
 func (s *Service) upsertGoogleUser(ctx context.Context, info *googleUserInfo) (*user.User, error) {
