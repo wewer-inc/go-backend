@@ -92,6 +92,35 @@ func TestConcurrentRefreshOnPostgres(t *testing.T) {
 	}
 }
 
+func TestOlderGenerationRevokesTheFamilyOnPostgres(t *testing.T) {
+	e := newPGEnv(t)
+	gen0 := e.login(t, e.addUser(t, entities.RoleUser))
+	gen1 := decodeData[AuthResponse](t, e.refresh(t, gen0.RefreshToken)).Tokens
+	gen2 := decodeData[AuthResponse](t, e.refresh(t, gen1.RefreshToken)).Tokens
+
+	if w := e.refresh(t, gen1.RefreshToken); w.Code != http.StatusConflict {
+		t.Fatalf("N-1 inside the window: %d %s", w.Code, w.Body.String())
+	}
+	if !e.securedOK(t, gen2.AccessToken) {
+		t.Fatal("N-1 inside the window must not revoke")
+	}
+	if w := e.refresh(t, "a-token-nobody-ever-issued"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown: %d", w.Code)
+	}
+	if !e.securedOK(t, gen2.AccessToken) {
+		t.Fatal("an unknown token must not revoke")
+	}
+	if w := e.refresh(t, gen0.RefreshToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("N-2: %d %s", w.Code, w.Body.String())
+	}
+	if e.securedOK(t, gen2.AccessToken) {
+		t.Fatal("N-2 must revoke the family")
+	}
+	if w := e.refresh(t, gen2.RefreshToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("the current token survived: %d", w.Code)
+	}
+}
+
 func TestReplayAndRevocationOnPostgres(t *testing.T) {
 	e := newPGEnv(t)
 	u := e.addUser(t, entities.RoleUser)

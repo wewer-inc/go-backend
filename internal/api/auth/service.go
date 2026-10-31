@@ -38,6 +38,9 @@ const codeRefreshRetry = "refresh_retry"
 // maxUserAgentLen bounds what is stored from a header the client fully controls.
 const maxUserAgentLen = 512
 
+// errLostRotation rolls back a rotation that another request got to first.
+var errLostRotation = errors.New("auth: lost the rotation")
+
 // LoginContext is the client behind a request, stored on its session.
 type LoginContext struct {
 	UserAgent string
@@ -49,6 +52,7 @@ type Service struct {
 	db          *gorm.DB
 	userRepo    repo.Repo[user.User]
 	sessionRepo repo.Repo[session.Session]
+	retiredRepo repo.Repo[session.RetiredRefreshToken]
 	issuer      platformauth.Issuer
 	redis       *goredis.Client
 	audit       *auditlog.Recorder
@@ -91,6 +95,7 @@ func NewService(d Deps) *Service {
 		db:              d.DB,
 		userRepo:        repo.NewGormRepo[user.User](d.DB),
 		sessionRepo:     repo.NewGormRepo[session.Session](d.DB),
+		retiredRepo:     repo.NewGormRepo[session.RetiredRefreshToken](d.DB),
 		issuer:          d.Issuer,
 		redis:           d.Redis,
 		audit:           d.Audit,
@@ -260,24 +265,35 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string, lc Log
 		return nil, apierr.InternalErr(err, "failed to issue access token")
 	}
 
-	// A compare-and-set on the hash we read: of two requests holding the same token only
-	// one writes, so nobody walks away with a token that matches no row. The revoked_at
-	// guard stops a rotation from answering after a concurrent sign-out.
-	rotated, err := s.sessionRepo.UpdateColumnsGuarded(ctx, sess.ID,
-		map[string]any{"refresh_token_hash": hash, "revoked_at": nil},
-		nil,
-		map[string]any{
-			"refresh_token_hash":      platformauth.HashToken(newRefresh),
-			"prev_refresh_token_hash": hash,
-			"rotated_at":              now,
-			"last_used_at":            now,
-			"expires_at":              earliest(now.Add(s.refreshTTL), sess.AbsoluteExpiry),
-		})
+	// The update only applies if the session still has the hash read above, so when two
+	// requests race with one token a single one writes, and no client is handed a token that
+	// matches no row. Requiring revoked_at to be empty keeps a rotation from succeeding after
+	// a concurrent sign-out. The retired hash is written in the same transaction, which means
+	// a token cannot leave the session without also becoming recognizable as retired.
+	err = store.WithTx(ctx, s.db, func(ctx context.Context, _ *gorm.DB) error {
+		rotated, err := s.sessionRepo.UpdateColumnsGuarded(ctx, sess.ID,
+			map[string]any{"refresh_token_hash": hash, "revoked_at": nil},
+			nil,
+			map[string]any{
+				"refresh_token_hash":      platformauth.HashToken(newRefresh),
+				"prev_refresh_token_hash": hash,
+				"rotated_at":              now,
+				"last_used_at":            now,
+				"expires_at":              earliest(now.Add(s.refreshTTL), sess.AbsoluteExpiry),
+			})
+		if err != nil {
+			return err
+		}
+		if !rotated {
+			return errLostRotation
+		}
+		return s.retiredRepo.Create(ctx, &session.RetiredRefreshToken{SessionID: sess.ID, TokenHash: hash, RetiredAt: now})
+	})
+	if errors.Is(err, errLostRotation) {
+		return nil, s.raceRefusal(ctx, sess, lc)
+	}
 	if err != nil {
 		return nil, apierr.InternalErr(err, "failed to rotate session")
-	}
-	if !rotated {
-		return nil, s.raceRefusal(ctx, sess, lc)
 	}
 
 	s.record(ctx, audit.EventTokenRefresh, &u.ID, lc.IP, map[string]any{"session": sess.UUID.String()})
@@ -287,12 +303,21 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string, lc Log
 // judgeRetiredToken handles a hash that matches no session's current token, and every
 // path through it ends in an error.
 //
-// Matching the previous hash says the token was this session's one generation ago. If the
-// rotation is younger than the race window, this is a concurrent caller that lost, and the
-// session is left alone. Older than that, every legitimate holder has long had the
-// replacement, so this is the replay the control exists for and the session is revoked.
+// An unknown hash is a plain refusal. A known retired hash revokes its session unless it
+// belongs to the immediately previous generation and that rotation is inside the race
+// window, in which case the caller merely lost to a concurrent refresh. Older generations
+// never qualify. Two rotations have passed since such a token was live, and if the
+// presenter did not perform them then somebody else did, which is what theft looks like
+// when the real owner returns after the attacker has already rotated.
 func (s *Service) judgeRetiredToken(ctx context.Context, hash string, lc LoginContext) error {
-	reused, err := s.sessionRepo.GetOne(ctx, store.QueryOpts{Filters: map[string]any{"prev_refresh_token_hash": hash}})
+	retired, err := s.retiredRepo.GetOne(ctx, store.QueryOpts{Filters: map[string]any{"token_hash": hash}})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return apierr.UnauthorizedCode("session_expired", "invalid refresh token")
+	}
+	if err != nil {
+		return apierr.InternalErr(err, "refresh lookup failed")
+	}
+	reused, err := s.sessionRepo.GetByID(ctx, retired.SessionID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return apierr.UnauthorizedCode("session_expired", "invalid refresh token")
 	}
@@ -302,7 +327,8 @@ func (s *Service) judgeRetiredToken(ctx context.Context, hash string, lc LoginCo
 	if reused.RevokedAt != nil {
 		return apierr.UnauthorizedCode("session_expired", "session revoked")
 	}
-	if reused.RotatedAt != nil && time.Since(*reused.RotatedAt) <= s.raceWindow {
+	previousGeneration := reused.PrevRefreshTokenHash == hash
+	if previousGeneration && reused.RotatedAt != nil && time.Since(*reused.RotatedAt) <= s.raceWindow {
 		return s.raceRefusal(ctx, reused, lc)
 	}
 

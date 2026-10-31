@@ -151,7 +151,7 @@ For flows that coordinate multiple repos, send email, or enqueue a job — add a
 
 `DELETE /v1/auth/sessions` signs out every session but the current one.
 
-Refresh tokens rotate on every use. If several requests refresh with the same token at once, one succeeds and the others get `409 refresh_retry`: keep the session, and retry with the newest token. Presenting a rotated token after `REFRESH_RACE_WINDOW` is treated as theft and revokes the session.
+Refresh tokens rotate on every use. If several requests refresh with the same token at once, one succeeds and the others get `409 refresh_retry`: keep the session, and retry with the newest token. Presenting the previous token after `REFRESH_RACE_WINDOW`, or any older one at any time, is treated as theft and revokes the session.
 
 Passwords must be 12 characters to 72 bytes, with no composition rules, and differ from the last `PASSWORD_HISTORY_COUNT`. Repeated failed sign-ins lock an address for `AUTH_LOCKOUT_WINDOW`. `forgot-password` answers the same for every well-formed address and does all its work on the worker, so neither the response nor its timing reveals whether an account exists. Set `PASSWORD_RESET_URL` or no reset email is sent.
 

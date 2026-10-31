@@ -125,7 +125,8 @@ func openTestDB(t *testing.T) *gorm.DB {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(
-		&audit.Log{}, &session.Session{}, &passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{},
+		&audit.Log{}, &session.Session{}, &session.RetiredRefreshToken{},
+		&passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{},
 	); err != nil {
 		t.Fatal(err)
 	}

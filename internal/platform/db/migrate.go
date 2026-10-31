@@ -76,5 +76,14 @@ func migrations() []*gormigrate.Migration {
 				return tx.Migrator().DropTable(&passwordreset.Token{}, &passwordhistory.Entry{}, &loginfailure.Failure{})
 			},
 		},
+		{
+			ID: "0006_session_refresh_tokens",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.AutoMigrate(&session.RetiredRefreshToken{})
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return tx.Migrator().DropTable(&session.RetiredRefreshToken{})
+			},
+		},
 	}
 }

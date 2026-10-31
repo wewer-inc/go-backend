@@ -150,9 +150,10 @@ POST /v1/auth/refresh
     ├─ rotate with a compare-and-set on that hash, remembering the previous one
     └─ return { access_token, refresh_token }
 
-    The previous token presented again:
-    ├─ within REFRESH_RACE_WINDOW: a concurrent request lost. 409 refresh_retry, session kept
-    └─ later: a replay. The session is revoked
+    A retired token presented again:
+    ├─ the previous generation, within REFRESH_RACE_WINDOW: a concurrent request lost.
+    │  409 refresh_retry, session kept
+    └─ anything else: a replay. The session is revoked
 
 Authenticated request:
     Authorization: Bearer <access_token>

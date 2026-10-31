@@ -117,6 +117,148 @@ func TestReplayedTokenRevokesTheFamily(t *testing.T) {
 	}
 }
 
+// A thief rotates twice before the victim comes back. The victim's token is then two
+// generations old, and it must still bring the whole family down, the thief's token with it.
+func TestVictimsOlderTokenRevokesTheFamilyAfterTheThiefRotatesTwice(t *testing.T) {
+	e := newEnv(t)
+	victim := e.login(t, e.addUser(t, entities.RoleUser))
+	stolen := decodeData[AuthResponse](t, e.refresh(t, victim.RefreshToken)).Tokens
+	thief := decodeData[AuthResponse](t, e.refresh(t, stolen.RefreshToken)).Tokens
+	if !e.securedOK(t, thief.AccessToken) {
+		t.Fatal("setup: the thief's token should work")
+	}
+
+	w := e.refresh(t, victim.RefreshToken)
+	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "session_expired" {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if e.sessionByRefresh(t, thief.RefreshToken).RevokedAt == nil {
+		t.Fatal("the family must be revoked")
+	}
+	if e.securedOK(t, thief.AccessToken) {
+		t.Fatal("the thief's access token survived")
+	}
+	if w := e.refresh(t, thief.RefreshToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("the thief's refresh token survived: %d", w.Code)
+	}
+	if n := e.countEvents(t, audit.EventRefreshReuse); n != 1 {
+		t.Fatalf("%d reuse events", n)
+	}
+}
+
+// The race window is for a request that lost one rotation. It says nothing about a token
+// from further back, however recent the rotations.
+func TestRaceWindowDoesNotCoverOlderGenerations(t *testing.T) {
+	e := newEnv(t)
+	gen0 := e.login(t, e.addUser(t, entities.RoleUser))
+	gen1 := decodeData[AuthResponse](t, e.refresh(t, gen0.RefreshToken)).Tokens
+	gen2 := decodeData[AuthResponse](t, e.refresh(t, gen1.RefreshToken)).Tokens
+	gen3 := decodeData[AuthResponse](t, e.refresh(t, gen2.RefreshToken)).Tokens
+
+	// Generation N-1 inside the window keeps the session...
+	if w := e.refresh(t, gen2.RefreshToken); w.Code != http.StatusConflict {
+		t.Fatalf("N-1: %d %s", w.Code, w.Body.String())
+	}
+	if e.sessionByRefresh(t, gen3.RefreshToken).RevokedAt != nil {
+		t.Fatal("N-1 inside the window revoked the family")
+	}
+	// ...while N-2, rotated seconds ago, does not.
+	if w := e.refresh(t, gen1.RefreshToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("N-2: %d %s", w.Code, w.Body.String())
+	}
+	if e.sessionByRefresh(t, gen3.RefreshToken).RevokedAt == nil {
+		t.Fatal("N-2 must revoke the family even inside the window")
+	}
+}
+
+func TestPreviousGenerationOutsideTheWindowRevokes(t *testing.T) {
+	e := newEnv(t)
+	gen0 := e.login(t, e.addUser(t, entities.RoleUser))
+	gen1 := decodeData[AuthResponse](t, e.refresh(t, gen0.RefreshToken)).Tokens
+	gen2 := decodeData[AuthResponse](t, e.refresh(t, gen1.RefreshToken)).Tokens
+	e.ageRotation(t, e.sessionByRefresh(t, gen2.RefreshToken).ID)
+
+	if w := e.refresh(t, gen1.RefreshToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if e.sessionByRefresh(t, gen2.RefreshToken).RevokedAt == nil {
+		t.Fatal("expected revocation")
+	}
+}
+
+func TestUnknownTokenRevokesNothingEvenWithRetiredTokensAround(t *testing.T) {
+	e := newEnv(t)
+	gen0 := e.login(t, e.addUser(t, entities.RoleUser))
+	gen1 := decodeData[AuthResponse](t, e.refresh(t, gen0.RefreshToken)).Tokens
+	gen2 := decodeData[AuthResponse](t, e.refresh(t, gen1.RefreshToken)).Tokens
+
+	w := e.refresh(t, "a-token-nobody-ever-issued")
+	if w.Code != http.StatusUnauthorized || errorCode(t, w) != "session_expired" {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if e.sessionByRefresh(t, gen2.RefreshToken).RevokedAt != nil {
+		t.Fatal("an unknown token revoked a session")
+	}
+	if n := e.countEvents(t, audit.EventRefreshReuse); n != 0 {
+		t.Fatalf("%d reuse events", n)
+	}
+}
+
+// One family's retired token must only ever bring down that family.
+func TestReplayLeavesOtherFamiliesAlone(t *testing.T) {
+	e := newEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	other := e.login(t, u)
+	gen0 := e.login(t, u)
+	gen1 := decodeData[AuthResponse](t, e.refresh(t, gen0.RefreshToken)).Tokens
+	decodeData[AuthResponse](t, e.refresh(t, gen1.RefreshToken))
+
+	if w := e.refresh(t, gen0.RefreshToken); w.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d", w.Code)
+	}
+	if !e.securedOK(t, other.AccessToken) {
+		t.Fatal("another device was signed out")
+	}
+}
+
+func TestRetiredTokensAreKeptOnlyAsHashes(t *testing.T) {
+	e := newEnv(t)
+	gen0 := e.login(t, e.addUser(t, entities.RoleUser))
+	gen1 := decodeData[AuthResponse](t, e.refresh(t, gen0.RefreshToken)).Tokens
+	gen2 := decodeData[AuthResponse](t, e.refresh(t, gen1.RefreshToken)).Tokens
+
+	var rows []session.RetiredRefreshToken
+	if err := e.db.Order("id ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("%d retired rows", len(rows))
+	}
+	s := e.sessionByRefresh(t, gen2.RefreshToken)
+	for i, raw := range []string{gen0.RefreshToken, gen1.RefreshToken} {
+		if rows[i].TokenHash != platformauth.HashToken(raw) || rows[i].SessionID != s.ID || rows[i].RetiredAt.IsZero() {
+			t.Fatalf("row %d: %+v", i, rows[i])
+		}
+	}
+}
+
+// If the retired hash cannot be written, the rotation must not stand: the old token would
+// be gone from the session without a trace, and replaying it would revoke nothing.
+func TestRotationRollsBackIfTheRetiredHashCannotBeWritten(t *testing.T) {
+	e := newEnv(t)
+	tokens := e.login(t, e.addUser(t, entities.RoleUser))
+	if err := e.db.Migrator().DropTable(&session.RetiredRefreshToken{}); err != nil {
+		t.Fatal(err)
+	}
+	if w := e.refresh(t, tokens.RefreshToken); w.Code != http.StatusInternalServerError {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	s := e.sessionByRefresh(t, tokens.RefreshToken)
+	if s.PrevRefreshTokenHash != "" || s.RotatedAt != nil {
+		t.Fatalf("the rotation was not rolled back: %+v", s)
+	}
+}
+
 // Without rotated_at nothing can show the replay was a race, so it counts as token reuse.
 func TestReplayWithNoRotationTimeRevokes(t *testing.T) {
 	e := newEnv(t)

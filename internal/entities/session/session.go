@@ -20,9 +20,10 @@ const (
 // refresh token is opaque and only the SHA-256 hash is stored, so a database dump yields
 // nothing usable.
 //
-// A session is one token family: rotation updates this row rather than adding one, and
-// PrevRefreshTokenHash remembers the generation before, which is how a replay is spotted.
-// Replaying a token older than that matches no row and is simply refused.
+// A session is one token family: rotation updates this row rather than adding one. Each
+// retired token leaves a RetiredRefreshToken behind, which is how a replay of any earlier
+// generation is spotted. PrevRefreshTokenHash singles out the generation just before the
+// current one, the only one a concurrent refresh can legitimately still hold.
 type Session struct {
 	gorm.Model
 	UUID                 uuid.UUID   `gorm:"type:uuid;uniqueIndex;not null" json:"uuid"`
@@ -49,3 +50,19 @@ type Session struct {
 }
 
 func (Session) TableName() string { return "sessions" }
+
+// RetiredRefreshToken is the hash of a refresh token a session has rotated past, kept for
+// the session's lifetime. Without it, a thief who rotates twice leaves the victim holding
+// a token two generations old, which would look unknown and revoke nothing.
+//
+// A session gains one row per refresh, so its rows are bounded by SESSION_ABSOLUTE_TTL
+// divided by the access token's lifetime. Nothing purges sessions yet; whatever comes to
+// purge them must delete these rows too.
+type RetiredRefreshToken struct {
+	ID        uint      `gorm:"primaryKey"`
+	SessionID uint      `gorm:"not null;index"`
+	TokenHash string    `gorm:"type:text;not null;uniqueIndex"`
+	RetiredAt time.Time `gorm:"not null"`
+}
+
+func (RetiredRefreshToken) TableName() string { return "session_refresh_tokens" }
