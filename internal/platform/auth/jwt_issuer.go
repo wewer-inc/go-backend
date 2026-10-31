@@ -31,12 +31,19 @@ type IssuedToken struct {
 type AccessParams struct {
 	Subject string // user UUID
 	SID     string // session UUID
+	// Impersonator is the user id behind a "login as" session, carried as the act claim.
+	// Numeric because audit rows key on it, and a UUID would cost a lookup per audited
+	// action. Zero for an ordinary session, and the claim is then absent.
+	Impersonator uint
+	// TTL overrides the issuer's default lifetime when set.
+	TTL time.Duration
 }
 
 // tokenClaims is the full claim set carried by every token.
 type tokenClaims struct {
 	TokenUse TokenUse `json:"token_use"`
 	SID      string   `json:"sid,omitempty"`
+	Act      uint     `json:"act,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -63,13 +70,18 @@ func NewJWTIssuer(secret, issuer, audience string, accessExpiry time.Duration) *
 }
 
 func (i *JWTIssuer) IssueAccessToken(p AccessParams) (IssuedToken, error) {
+	ttl := i.accessTokenExpiry
+	if p.TTL != 0 {
+		ttl = p.TTL
+	}
 	now := time.Now()
-	expiresAt := now.Add(i.accessTokenExpiry)
+	expiresAt := now.Add(ttl)
 	jti := uuid.NewString()
 
 	claims := tokenClaims{
 		TokenUse: UseAccess,
 		SID:      p.SID,
+		Act:      p.Impersonator,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   p.Subject,
 			Issuer:    i.issuer,

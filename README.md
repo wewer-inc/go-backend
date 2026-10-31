@@ -153,6 +153,7 @@ For flows that coordinate multiple repos, send email, or enqueue a job — add a
 | POST   | `/v1/auth/mfa/enroll/confirm` | Bearer |
 | GET    | `/v1/auth/mfa/status`      | Bearer |
 | POST   | `/v1/auth/mfa/backup-codes/regenerate` | Bearer |
+| POST   | `/v1/auth/impersonate/end` | Bearer |
 
 `DELETE /v1/auth/sessions` signs out every session but the current one.
 
@@ -187,6 +188,9 @@ On an account with two-factor authentication on, `login` and the Google callback
 | GET    | `/v1/admin/audit`      | permission `admin.audit:read` |
 | GET    | `/v1/admin/audit/verify` | permission `admin.audit:read` |
 | POST   | `/v1/admin/users/:uuid/mfa/reset` | capability `admin.users.mfa:reset`, plus the admin's own TOTP code |
+| POST   | `/v1/admin/users/:uuid/impersonate` | capability `admin.users:impersonate` |
+
+"Login as" issues a five-minute access token with no refresh token. It cannot nest, cannot target an admin or yourself, and cannot change the account's password, MFA or other sessions. Every audit row written inside it names the impersonator, and the user's session list labels it.
 
 The audit trail is a hash chain (`internal/platform/auditlog`). On its own it cannot detect tail truncation: deleting the newest rows, or all of them, leaves a valid shorter chain, and the hash is unkeyed, so someone able to rewrite the table can recompute it. To detect those, store `head_id` and `head` from `/verify` somewhere the database's writers cannot modify, and pass them back as `?checkpoint_id=&checkpoint_hash=`. Nothing here exports them for you.
 

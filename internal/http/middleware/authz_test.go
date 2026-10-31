@@ -44,6 +44,20 @@ func TestPermissionGateStatusBySubject(t *testing.T) {
 	}
 }
 
+func TestRefuseImpersonated(t *testing.T) {
+	gate := RefuseImpersonated()
+	imp := uint(9)
+	if w := gated(nil, gate); w.Code != http.StatusUnauthorized {
+		t.Errorf("no subject: %d", w.Code)
+	}
+	if w := gated(&authz.Subject{UserID: 1, Role: entities.RoleUser}, gate); w.Code != http.StatusOK {
+		t.Errorf("ordinary session: %d", w.Code)
+	}
+	if w := gated(&authz.Subject{UserID: 1, Role: entities.RoleUser, Impersonator: &imp}, gate); w.Code != http.StatusForbidden {
+		t.Errorf("login-as session: %d", w.Code)
+	}
+}
+
 func TestRequireCapabilityAppliesTheImpersonationBar(t *testing.T) {
 	gate := RequireCapability(authz.CapUsersRoleUpdate)
 	imp := uint(9)

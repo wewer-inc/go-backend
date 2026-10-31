@@ -25,6 +25,34 @@ func TestIssuedAccessTokenVerifiesWithItsClaims(t *testing.T) {
 	}
 }
 
+func TestImpersonationClaimsRoundTrip(t *testing.T) {
+	iss := NewJWTIssuer(secret, "iss", "aud", 15*time.Minute)
+	v := NewJWTVerifier(secret, "iss", "aud")
+
+	plain, err := iss.IssueAccessToken(AccessParams{Subject: "u", SID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := v.Verify(plain.Token); err != nil || c.Impersonator != 0 {
+		t.Fatalf("an ordinary token must carry no actor: %+v %v", c, err)
+	}
+
+	short, err := iss.IssueAccessToken(AccessParams{Subject: "u", SID: "s", Impersonator: 7, TTL: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := v.Verify(short.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Impersonator != 7 {
+		t.Fatalf("act = %d", c.Impersonator)
+	}
+	if left := time.Until(c.ExpiresAt); left > 5*time.Minute || left < 4*time.Minute {
+		t.Fatalf("lifetime %v, want about five minutes", left)
+	}
+}
+
 func TestVerifierRefuses(t *testing.T) {
 	good, err := NewJWTIssuer(secret, "iss", "aud", time.Minute).IssueAccessToken(AccessParams{Subject: "u"})
 	if err != nil {

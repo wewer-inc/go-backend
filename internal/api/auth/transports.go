@@ -118,6 +118,15 @@ type PermissionsResponse struct {
 	Scopes       map[authz.Resource]string `json:"scopes"`
 }
 
+// ImpersonateResponse has no refresh token field by design: the access token it carries
+// is all the session will ever get.
+type ImpersonateResponse struct {
+	AccessToken string       `json:"access_token"`
+	ExpiresAt   time.Time    `json:"expires_at"`
+	SessionUUID string       `json:"session_uuid"`
+	Target      UserResponse `json:"target"`
+}
+
 // SessionView is a session as shown to the user who owns it. Hashes never leave the
 // server.
 type SessionView struct {

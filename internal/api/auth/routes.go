@@ -60,16 +60,24 @@ func RegisterRoutes(v1, secured, admin *gin.RouterGroup, d Deps) {
 	sec := secured.Group("/auth")
 	{
 		sec.POST("/logout", h.Logout)
-		sec.POST("/change-password", h.ChangePassword)
 		sec.GET("/permissions", h.Permissions)
 		sec.GET("/sessions", h.ListSessions)
-		sec.DELETE("/sessions", h.RevokeOtherSessions)
-		sec.DELETE("/sessions/:sid", h.RevokeSession)
-		sec.POST("/mfa/enroll/start", h.MFAEnrollStart)
-		sec.POST("/mfa/enroll/confirm", h.MFAEnrollConfirm)
 		sec.GET("/mfa/status", h.MFAStatus)
-		sec.POST("/mfa/backup-codes/regenerate", h.MFARegenerateBackupCodes)
+		sec.POST("/impersonate/end", h.EndImpersonation)
+	}
+
+	// The account's own credentials and sessions, which a login-as session must not touch.
+	own := sec.Group("")
+	own.Use(middleware.RefuseImpersonated())
+	{
+		own.POST("/change-password", h.ChangePassword)
+		own.DELETE("/sessions", h.RevokeOtherSessions)
+		own.DELETE("/sessions/:sid", h.RevokeSession)
+		own.POST("/mfa/enroll/start", h.MFAEnrollStart)
+		own.POST("/mfa/enroll/confirm", h.MFAEnrollConfirm)
+		own.POST("/mfa/backup-codes/regenerate", h.MFARegenerateBackupCodes)
 	}
 
 	admin.POST("/users/:uuid/mfa/reset", middleware.RequireCapability(authz.CapUsersMFAReset), h.AdminResetMFA)
+	admin.POST("/users/:uuid/impersonate", middleware.RequireCapability(authz.CapUsersImpersonate), h.StartImpersonation)
 }

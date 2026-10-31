@@ -39,6 +39,8 @@ func TestAuthRoutesAreRegisteredWithoutRedis(t *testing.T) {
 		{http.MethodPost, "/v1/auth/change-password", http.StatusUnauthorized},
 		{http.MethodPost, "/v1/auth/mfa/enroll/start", http.StatusUnauthorized},
 		{http.MethodPost, "/v1/admin/users/x/mfa/reset", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/admin/users/x/impersonate", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/auth/impersonate/end", http.StatusUnauthorized},
 		{http.MethodPost, "/v1/auth/logout", http.StatusUnauthorized},
 		{http.MethodGet, "/v1/auth/sessions", http.StatusUnauthorized},
 		{http.MethodDelete, "/v1/auth/sessions", http.StatusUnauthorized},

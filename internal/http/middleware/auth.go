@@ -10,6 +10,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auditlog"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store"
@@ -109,47 +110,70 @@ func authenticator(
 			return false
 		}
 
-		if !sessionAlive(c, sessionRepo, claims, u.ID) {
+		sess, ok := liveSession(c, sessionRepo, claims, u.ID)
+		if !ok {
 			return false
+		}
+		// The token and the row must agree on who is behind the session. A token claiming an
+		// actor its session does not name, or hiding one it does, is refused.
+		if !sameImpersonator(claims.Impersonator, sess.ImpersonatorUserID) {
+			unauthorized(c, "invalid or expired token")
+			return false
+		}
+
+		// The role is read from the user row loaded above and ignored in the token, so a
+		// demotion applies from the very next request.
+		subject := authz.Subject{UserID: u.ID, Role: u.PlatformRole}
+		if claims.Impersonator != 0 {
+			impersonator := claims.Impersonator
+			subject.Impersonator = &impersonator
+			// Carrying the id on the context means audit rows written later in this
+			// request name the impersonator without each handler passing it along.
+			c.Request = c.Request.WithContext(auditlog.ContextWithImpersonator(c.Request.Context(), impersonator))
 		}
 
 		c.Set(ctxActorUserID, u.ID)
 		c.Set(ctxActorUserUUID, u.UUID.String())
 		c.Set(ctxActorPlatformRole, u.PlatformRole)
 		c.Set(ctxActorClaims, claims)
-		// The role comes from the row just loaded, not the token, so a demotion takes
-		// effect on the next request rather than when the token expires.
-		c.Set(ctxActorSubject, authz.Subject{UserID: u.ID, Role: u.PlatformRole})
+		c.Set(ctxActorSubject, subject)
 
 		return true
 	}
 }
 
-// sessionAlive checks the token's session against the database, which is what makes
-// revocation take effect on the next request rather than when the token expires. A token
-// with no session cannot be revoked, so it is refused. A failed read is a 503, not a 401:
-// an outage must not read to the client as being signed out.
-func sessionAlive(c *gin.Context, sessionRepo repo.Repo[session.Session], claims *auth.Claims, userID uint) bool {
+// liveSession loads the token's session and rejects it if it is gone, revoked, expired or
+// someone else's. Doing this on every request is how a revocation can apply at once, and
+// a token with no session is rejected because it could never be revoked. A failed read
+// answers 503 so that a database outage does not look like a sign-out to the client.
+func liveSession(c *gin.Context, sessionRepo repo.Repo[session.Session], claims *auth.Claims, userID uint) (*session.Session, bool) {
 	sid, err := uuid.Parse(claims.SID)
 	if err != nil {
 		unauthorized(c, "invalid or expired token")
-		return false
+		return nil, false
 	}
 	sess, err := sessionRepo.GetOne(c.Request.Context(), store.QueryOpts{Filters: map[string]any{"uuid": sid}})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		unauthorized(c, "session revoked")
-		return false
+		return nil, false
 	}
 	if err != nil {
 		_ = c.Error(err)
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, apicommon.Response[any]{Error: "auth_unavailable", Message: "session store unavailable"})
-		return false
+		return nil, false
 	}
 	if sess.UserID != userID || sess.RevokedAt != nil || time.Now().After(sess.AbsoluteExpiry) {
 		unauthorized(c, "session revoked")
-		return false
+		return nil, false
 	}
-	return true
+	return sess, true
+}
+
+func sameImpersonator(claim uint, row *uint) bool {
+	if row == nil {
+		return claim == 0
+	}
+	return claim == *row
 }
 
 // AdminAuth authenticates like UserAuth and additionally enforces admin role, before

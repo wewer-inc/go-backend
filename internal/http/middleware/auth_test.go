@@ -10,6 +10,7 @@ import (
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/session"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/entities/user"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/auth"
+	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/platform/authz"
 	"github.com/YOUR_GITHUB_ORG/YOUR_APP_NAME/internal/store/repo"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -204,6 +205,76 @@ func TestUserAuthAnswers503WhenSessionsCannotBeRead(t *testing.T) {
 	}
 	if w := call(e.userAuthRouter(), e.tokenFor(t, u, s.UUID.String())); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status %d", w.Code)
+	}
+}
+
+func TestUserAuthSetsTheImpersonatorFromTheToken(t *testing.T) {
+	e := newAuthEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	s := e.addSession(t, u)
+	imp := uint(42)
+	if err := e.db.Model(s).Update("impersonator_user_id", &imp).Error; err != nil {
+		t.Fatal(err)
+	}
+	tok, err := e.issuer.IssueAccessToken(auth.AccessParams{Subject: u.UUID.String(), SID: s.UUID.String(), Impersonator: imp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got authz.Subject
+	r := gin.New()
+	r.GET("/x", UserAuth(e.verifier, e.users, e.sessions, nil, false), func(c *gin.Context) {
+		got, _ = GetActorSubject(c)
+		c.Status(http.StatusOK)
+	})
+	if w := call(r, tok.Token); w.Code != http.StatusOK {
+		t.Fatalf("status %d", w.Code)
+	}
+	if got.Impersonator == nil || *got.Impersonator != imp || got.UserID != u.ID {
+		t.Fatalf("subject = %+v", got)
+	}
+}
+
+func TestOrdinarySessionHasNoImpersonator(t *testing.T) {
+	e := newAuthEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	var got authz.Subject
+	r := gin.New()
+	r.GET("/x", UserAuth(e.verifier, e.users, e.sessions, nil, false), func(c *gin.Context) {
+		got, _ = GetActorSubject(c)
+		c.Status(http.StatusOK)
+	})
+	if w := call(r, e.tokenFor(t, u, e.addSession(t, u).UUID.String())); w.Code != http.StatusOK {
+		t.Fatalf("status %d", w.Code)
+	}
+	if got.Impersonator != nil {
+		t.Fatalf("subject = %+v", got)
+	}
+}
+
+// The token and the session must agree. Otherwise a token without act could drop the
+// label from a login-as session, or one with act could pin blame on someone else.
+func TestUserAuthRefusesAMismatchedImpersonator(t *testing.T) {
+	e := newAuthEnv(t)
+	u := e.addUser(t, entities.RoleUser)
+	ordinary := e.addSession(t, u)
+	loginAs := e.addSession(t, u)
+	imp := uint(42)
+	if err := e.db.Model(loginAs).Update("impersonator_user_id", &imp).Error; err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]auth.AccessParams{
+		"act on an ordinary session":      {Subject: u.UUID.String(), SID: ordinary.UUID.String(), Impersonator: 42},
+		"no act on a login-as session":    {Subject: u.UUID.String(), SID: loginAs.UUID.String()},
+		"wrong act on a login-as session": {Subject: u.UUID.String(), SID: loginAs.UUID.String(), Impersonator: 43},
+	}
+	for name, p := range cases {
+		tok, err := e.issuer.IssueAccessToken(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := call(e.userAuthRouter(), tok.Token); w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: %d", name, w.Code)
+		}
 	}
 }
 

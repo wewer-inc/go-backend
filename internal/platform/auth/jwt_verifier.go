@@ -17,11 +17,13 @@ var (
 
 // Claims is the validated, caller-facing view of a verified token.
 type Claims struct {
-	Subject   string
-	TokenUse  TokenUse
-	JTI       string
-	SID       string
-	ExpiresAt time.Time
+	Subject  string
+	TokenUse TokenUse
+	JTI      string
+	SID      string
+	// Impersonator is the act claim: who is behind a "login as" session, zero otherwise.
+	Impersonator uint
+	ExpiresAt    time.Time
 }
 
 type Verifier interface {
@@ -89,6 +91,8 @@ func (v *JWTVerifier) Verify(tokenString string) (*Claims, error) {
 		TokenUse: claims.TokenUse,
 		JTI:      claims.ID,
 		SID:      claims.SID,
+
+		Impersonator: claims.Act,
 	}
 	if claims.ExpiresAt != nil {
 		out.ExpiresAt = claims.ExpiresAt.Time

@@ -67,6 +67,26 @@ func RequireCapability(capability authz.Capability) gin.HandlerFunc {
 	}
 }
 
+// RefuseImpersonated rejects a request made from a "login as" session. It belongs on the
+// routes that alter an account's own credentials or sessions, since impersonation exists
+// for viewing an account and not for changing its password or ending its sessions. Every
+// user may call those routes on themselves, so no capability covers them and the
+// capability bar cannot help.
+func RefuseImpersonated() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		s, ok := GetActorSubject(c)
+		if !ok {
+			unauthorized(c, "unauthorized")
+			return
+		}
+		if s.Impersonator != nil {
+			deny(c, "account_security", s, authz.ReasonImpersonation)
+			return
+		}
+		c.Next()
+	}
+}
+
 func deny(c *gin.Context, permission string, s authz.Subject, reason authz.DenyReason) {
 	authzDeniedTotal.WithLabelValues(permission, string(s.Role), string(reason)).Inc()
 	e := apierr.Forbidden("insufficient permissions")

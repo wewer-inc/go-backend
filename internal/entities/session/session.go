@@ -14,6 +14,8 @@ type LoginMethod string
 const (
 	MethodPassword LoginMethod = "password"
 	MethodGoogle   LoginMethod = "google"
+	// MethodImpersonation is a "login as" session; ImpersonatorUserID says whose.
+	MethodImpersonation LoginMethod = "impersonation"
 )
 
 // Session is one signed-in device. Its UUID travels as the access token's sid claim. Its
