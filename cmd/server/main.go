@@ -30,6 +30,14 @@ func main() {
 		os.Exit(runHealthcheck())
 	}
 
+	// One-off migration mode: `YOUR_APP_NAME migrate` applies migrations and exits.
+	if flag.Arg(0) == "migrate" {
+		if err := app.Migrate(); err != nil {
+			fatal("migrate failed", err)
+		}
+		return
+	}
+
 	build := versioning.BuildInfo{Version: version, Commit: commit, Date: date}
 
 	application, err := app.Build(build)

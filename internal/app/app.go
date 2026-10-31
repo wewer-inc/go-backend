@@ -151,6 +151,29 @@ func Build(build versioning.BuildInfo) (*App, error) {
 	}, nil
 }
 
+// Migrate applies database migrations and exits. Run it as a one-off task before a
+// deploy, with DB_MIGRATE_ON_START=false on the service, so schema changes never race
+// across request-serving instances.
+func Migrate() error {
+	cfg := config.Load()
+	log := logger.NewLogger(cfg)
+	gdb, err := pdb.Start(context.Background(), pdb.Config{
+		DSN:             cfg.DB_DSN,
+		MigrateOnStart:  true,
+		MaxOpen:         1,
+		MaxIdle:         1,
+		ConnMaxLifetime: cfg.DB_CONN_LIFETIME,
+		ConnMaxIdleTime: cfg.DB_CONN_IDLE_TIME,
+		SlowThreshold:   cfg.DB_SLOW_THRESHOLD,
+		LogQueryValues:  cfg.DB_LOG_QUERY_VALUES,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	log.Info().Msg("migrate: complete")
+	return pdb.Stop(gdb)
+}
+
 func (a *App) Start() error {
 	// Bind the listener synchronously so a bind failure (e.g. port in use) is
 	// returned to the caller instead of only being logged from a goroutine.

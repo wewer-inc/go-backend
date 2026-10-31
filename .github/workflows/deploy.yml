@@ -1,0 +1,121 @@
+name: Deploy
+
+# Build, migrate, then roll out to ECS Fargate in one region. Configure the variables
+# below per GitHub Environment; the job is skipped until DEPLOY_ROLE_ARN is set, so a
+# fresh project does not fail here before its infrastructure exists.
+#
+# The migration step finishes before any new task starts, so the previous revision runs on
+# the new schema for the whole rollout, and would do so again after an ECS rollback. Every
+# migration therefore has to be additive (nullable columns, new tables, new indexes), and a
+# drop or rename waits for a later deploy.
+on:
+  push:
+    branches: [main, staging, dev]
+
+permissions:
+  contents: read
+
+# Deploys of one environment run in order and are never cancelled midway.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy (${{ github.ref_name }})
+    if: vars.DEPLOY_ROLE_ARN != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      id-token: write # short-lived AWS credentials through OIDC; no stored keys
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CLUSTER: ${{ vars.ECS_CLUSTER }}
+      SERVICE: ${{ vars.ECS_SERVICE }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      TASK_FAMILY: ${{ vars.TASK_FAMILY }}
+      TASK_CPU: ${{ vars.TASK_CPU }}
+      TASK_MEMORY: ${{ vars.TASK_MEMORY }}
+      EXEC_ROLE_ARN: ${{ vars.EXEC_ROLE_ARN }}
+      TASK_ROLE_ARN: ${{ vars.TASK_ROLE_ARN }}
+      SECRET_ARN: ${{ vars.SECRET_ARN }}
+      LOG_GROUP: ${{ vars.LOG_GROUP }}
+      SUBNETS: ${{ vars.SUBNETS }}
+      SERVICE_SG: ${{ vars.SERVICE_SG }}
+      APP_ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Build, tag, and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker build \
+            --build-arg VERSION="${GITHUB_REF_NAME}" \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Render and register task definition
+        run: |
+          set -euo pipefail
+          envsubst < deploy/taskdef.json > taskdef.rendered.json
+          TASKDEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.rendered.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "TASKDEF_ARN=$TASKDEF_ARN" >> "$GITHUB_ENV"
+
+      - name: Run database migrations (one-off task)
+        run: |
+          set -euo pipefail
+          SUBNET_JSON=$(jq -cn --arg s "$SUBNETS" '$s | split(",")')
+          NETCFG=$(jq -cn --argjson subnets "$SUBNET_JSON" --arg sg "$SERVICE_SG" \
+            '{awsvpcConfiguration:{subnets:$subnets,securityGroups:[$sg],assignPublicIp:"DISABLED"}}')
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --launch-type FARGATE \
+            --task-definition "$TASKDEF_ARN" \
+            --network-configuration "$NETCFG" \
+            --overrides '{"containerOverrides":[{"name":"backend","command":["migrate"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Migration task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+          describe_task() {
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --query "$1" --output text
+          }
+          # Select the container by name. If it never started, the query prints "None" for
+          # the missing exit code, and the comparison below treats that as a failure too.
+          EXIT=$(describe_task "tasks[0].containers[?name=='backend'].exitCode | [0]")
+          echo "Migration container exit code: $EXIT"
+          if [ "$EXIT" != "0" ]; then
+            echo "::error::Migration failed"
+            describe_task 'tasks[0].stoppedReason' || true
+            exit 1
+          fi
+
+      - name: Deploy to ECS and wait
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$TASKDEF_ARN" >/dev/null
+          # Enable the deployment circuit breaker on the service so a failed rollout rolls back.
+          aws ecs wait services-stable --cluster "$CLUSTER" --service "$SERVICE"
+          echo "Deployed ${IMAGE} to ${SERVICE} (${APP_ENV}, ${AWS_REGION})."
